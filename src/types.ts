@@ -1,0 +1,162 @@
+export const ROYAL_CLUSTER_IDS = ['0000', '1000', '2000', '3004', '4000'] as const
+
+export type RoyalClusterId = (typeof ROYAL_CLUSTER_IDS)[number]
+
+export type PriceWindow = '24h' | '7d' | '30d'
+
+export type ServerRegion = 'US' | 'EU' | 'ASIA'
+
+export type BuyPriceType = 'TRADE' | 'INSTANT_BUY' | 'BUY_ORDER'
+export type ArtifactFilter = 'NON_ARTIFACT' | 'RUNE' | 'SOUL' | 'RELIC' | 'OTHER'
+
+export type MaterialGroup = 'wood' | 'fiber' | 'ore' | 'hide' | 'rock' | 'other'
+
+export type SellTarget =
+  | 'Black Market'
+  | 'Caerleon'
+  | 'Thetford'
+  | 'Lymhurst'
+  | 'Bridgewatch'
+  | 'Martlock'
+  | 'Fort Sterling'
+
+export type EnchantmentLevel = 0 | 1 | 2 | 3 | 4
+
+export interface RecipeResource {
+  itemId: string
+  count: number
+  displayName: string
+}
+
+export interface CraftItem {
+  itemId: string
+  displayName: string
+  tier: number | null
+  craftingCategory: string
+  weight: number
+  itemValue: number
+  recipe: RecipeResource[]
+  availableEnchantments: EnchantmentLevel[]
+}
+
+export interface CraftVariant {
+  variantId: string
+  baseItemId: string
+  displayName: string
+  enchantment: EnchantmentLevel
+  marketItemId: string
+  tierLabel: string
+}
+
+export interface SelectedCraftPlan {
+  variantId: string
+  baseItemId: string
+  enchantment: EnchantmentLevel
+  quantity: number
+  craftCity: string
+  sellCity: SellTarget
+  buyPriceType: BuyPriceType
+  materialCityByGroup: Partial<Record<MaterialGroup, string>>
+  artifactBuyCity: string
+}
+
+export interface CityProfile {
+  clusterId: RoyalClusterId
+  cityName: string
+  baseCraftBonus: number
+  categoryBonuses: Record<string, number>
+}
+
+export interface GameData {
+  items: CraftItem[]
+  cityProfiles: CityProfile[]
+  categoryPresetCity: Record<string, string>
+  categories: string[]
+  cityNames: string[]
+  knownMarketItemIds: string[]
+}
+
+export interface DailyBonusSetting {
+  category: string
+  percent: 10 | 20
+}
+
+export interface AppSettings {
+  search: string
+  tierFilters: number[]
+  categoryFilter: 'ALL' | string
+  artifactFilters: ArtifactFilter[]
+  enchantmentFilters: EnchantmentLevel[]
+  serverRegion: ServerRegion
+  hasPremium: boolean
+  targetCity: SellTarget
+  dailyBonusA: DailyBonusSetting
+  dailyBonusB: DailyBonusSetting
+}
+
+export interface CachedPricePoint {
+  estimated: number | null
+  sellOrder: number | null
+  buyOrder: number | null
+  avgSoldPerDay30d: number | null
+  avgPrice30d: number | null
+}
+
+export interface PriceBook {
+  values: Record<string, CachedPricePoint>
+  fetchedAt: string | null
+  error: string | null
+}
+
+export interface MaterialCostLine {
+  baseItemId: string
+  marketItemId: string
+  displayName: string
+  materialGroup: MaterialGroup | null
+  buyCity: string
+  baseQuantity: number
+  quantity: number
+  returnedQuantity: number
+  unitPrice: number | null
+  totalCost: number | null
+  isArtifact: boolean
+}
+
+export interface PlannedCraftResult {
+  plan: SelectedCraftPlan
+  variant: CraftVariant
+  baseItem: CraftItem
+  craftCity: string
+  sellCity: SellTarget
+  returnRate: number
+  materialLines: MaterialCostLine[]
+  missingPrices: string[]
+  estimatedMarketValue: number | null
+  sellPriceUnit: number | null
+  avgSoldPerDay30d: number | null
+  avgPrice30d: number | null
+  materialBaseCost: number | null
+  materialEffectiveCost: number | null
+  itemValuePerCraft: number | null
+  stationNutrition: number | null
+  marketFee: number | null
+  transportFee: number | null
+  totalCost: number | null
+  revenue: number | null
+  netProfit: number | null
+  marginPct: number | null
+}
+
+export interface CraftPlanSummary {
+  plannedCrafts: number
+  readyCrafts: number
+  totalCost: number
+  totalRevenue: number
+  totalMarketFee: number
+  totalProfit: number
+}
+
+export interface PlannedCraftView {
+  results: PlannedCraftResult[]
+  summary: CraftPlanSummary
+}

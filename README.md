@@ -11,6 +11,24 @@ Currently, two official plugins are available:
 
 The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
+## Albion Crafting Data
+
+This app now uses a cleaned, compact dataset at `public/crafting-data.json`.
+
+- Generate/update it from the raw Albion files in `public/`:
+  - `npm run build:data`
+- The generated file only keeps fields needed by the calculator (recipes, names, tiers, weights, and royal-city crafting bonuses).
+- During cleanup, the generator excludes craft targets matching:
+  - `QUESTITEM*`
+  - `*ARTEFACT*`
+  - wardrobe/skin entries (`*UNLOCK_SKIN*`, `*WARDROBE*`, `*MOUNTSKIN*`, category `vanity`)
+  - `CAPEITEM_*_BP`
+  - dungeon/hellgate/corrupted map tokens
+- `src/dataLoader.ts` loads `crafting-data.json` first and falls back to the raw files if needed.
+- Enchantment `.1/.2/.3/.4` variants are generated from item metadata, so only valid enchantments appear per craft target.
+- Market-ID resolution supports both `@N` and `_LEVELN@N` forms to prevent missing-price errors on enchanted materials.
+- The planner supports multi-select tier/enchantment filters, a `None` daily-bonus option, and fixed Albion market-tax rules instead of manual flat-fee inputs.
+
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
