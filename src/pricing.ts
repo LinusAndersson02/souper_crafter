@@ -1,4 +1,4 @@
-import type { CachedPricePoint, PriceWindow, ServerRegion } from './types'
+import type { CachedPricePoint, PriceHistoryPoint, PriceWindow, ServerRegion } from './types'
 
 const API_BASE_BY_REGION: Record<ServerRegion, string> = {
   US: 'https://west.albion-online-data.com/api/v2',
@@ -59,6 +59,7 @@ interface HistoryAccumulator {
   all30dFallbackCount: number
   totalSold30d: number
   hasSold30d: boolean
+  series30d: Map<string, { weightedPriceSum: number; weightedPriceWeight: number; fallbackPriceSum: number; fallbackPriceCount: number; itemCount: number }>
 }
 
 export interface PriceFetchResult {
@@ -103,6 +104,7 @@ function createEmptyPricePoint(): CachedPricePoint {
     buyOrder: null,
     avgSoldPerDay30d: null,
     avgPrice30d: null,
+    history30d: [],
   }
 }
 
@@ -111,7 +113,7 @@ function mergePricePoint(
   key: string,
   patch: Partial<CachedPricePoint>,
 ): void {
-  const next = {
+  const next: CachedPricePoint = {
     ...(values[key] ?? createEmptyPricePoint()),
   }
 
@@ -122,7 +124,7 @@ function mergePricePoint(
       continue
     }
 
-    next[field] = value
+    ;(next as unknown as Record<string, unknown>)[field] = value
     changed = true
   }
 
@@ -274,6 +276,7 @@ async function fetchSpotPrices(
       buyOrder,
       avgSoldPerDay30d: null,
       avgPrice30d: null,
+      history30d: [],
     }
   }
 
@@ -340,6 +343,26 @@ function resolveAccumulatedAverage(
   return null
 }
 
+function buildHistorySeries(series30d: HistoryAccumulator['series30d']): PriceHistoryPoint[] {
+  return [...series30d.entries()]
+    .sort(([leftTimestamp], [rightTimestamp]) => Date.parse(leftTimestamp) - Date.parse(rightTimestamp))
+    .map(([timestamp, aggregate]) => {
+      let avgPrice: number | null = null
+
+      if (aggregate.weightedPriceWeight > 0) {
+        avgPrice = aggregate.weightedPriceSum / aggregate.weightedPriceWeight
+      } else if (aggregate.fallbackPriceCount > 0) {
+        avgPrice = aggregate.fallbackPriceSum / aggregate.fallbackPriceCount
+      }
+
+      return {
+        timestamp,
+        avgPrice,
+        itemCount: aggregate.itemCount > 0 ? aggregate.itemCount : null,
+      }
+    })
+}
+
 async function fetchHistoryAverages(
   itemIds: string[],
   locations: string[],
@@ -392,6 +415,7 @@ async function fetchHistoryAverages(
         all30dFallbackCount: 0,
         totalSold30d: 0,
         hasSold30d: false,
+        series30d: new Map(),
       }
 
       const preferredQuality = isPreferredQuality(toNumber(entry.quality))
@@ -411,6 +435,7 @@ async function fetchHistoryAverages(
           }
 
           if (in30d) {
+            const timestampKey = typeof point.timestamp === 'string' && point.timestamp.length > 0 ? point.timestamp : null
             if (itemCount && itemCount > 0) {
               accumulator.all30dWeightedSum += avgPrice && avgPrice > 0 ? avgPrice * itemCount : 0
               accumulator.all30dWeight += avgPrice && avgPrice > 0 ? itemCount : 0
@@ -419,6 +444,23 @@ async function fetchHistoryAverages(
                 accumulator.qualityOne30dWeightedSum += avgPrice && avgPrice > 0 ? avgPrice * itemCount : 0
                 accumulator.qualityOne30dWeight += avgPrice && avgPrice > 0 ? itemCount : 0
               }
+
+              if (timestampKey) {
+                const seriesPoint = accumulator.series30d.get(timestampKey) ?? {
+                  weightedPriceSum: 0,
+                  weightedPriceWeight: 0,
+                  fallbackPriceSum: 0,
+                  fallbackPriceCount: 0,
+                  itemCount: 0,
+                }
+
+                if (avgPrice && avgPrice > 0) {
+                  seriesPoint.weightedPriceSum += avgPrice * itemCount
+                  seriesPoint.weightedPriceWeight += itemCount
+                }
+                seriesPoint.itemCount += itemCount
+                accumulator.series30d.set(timestampKey, seriesPoint)
+              }
             } else if (avgPrice && avgPrice > 0) {
               accumulator.all30dFallbackSum += avgPrice
               accumulator.all30dFallbackCount += 1
@@ -426,6 +468,20 @@ async function fetchHistoryAverages(
               if (preferredQuality) {
                 accumulator.qualityOne30dFallbackSum += avgPrice
                 accumulator.qualityOne30dFallbackCount += 1
+              }
+
+              if (timestampKey) {
+                const seriesPoint = accumulator.series30d.get(timestampKey) ?? {
+                  weightedPriceSum: 0,
+                  weightedPriceWeight: 0,
+                  fallbackPriceSum: 0,
+                  fallbackPriceCount: 0,
+                  itemCount: 0,
+                }
+
+                seriesPoint.fallbackPriceSum += avgPrice
+                seriesPoint.fallbackPriceCount += 1
+                accumulator.series30d.set(timestampKey, seriesPoint)
               }
             }
           }
@@ -478,12 +534,13 @@ async function fetchHistoryAverages(
         accumulator.all30dFallbackCount,
       )
 
-      values[key] = {
+        values[key] = {
         estimated: preferredEstimated ?? fallbackEstimated,
         sellOrder: null,
         buyOrder: null,
         avgSoldPerDay30d: accumulator.hasSold30d ? accumulator.totalSold30d / THIRTY_DAY_WINDOW : null,
         avgPrice30d: preferredEstimated30d ?? fallbackEstimated30d,
+        history30d: buildHistorySeries(accumulator.series30d),
       }
     }
   }
@@ -557,5 +614,20 @@ export function getCachedPricePoint(
       typeof value.avgPrice30d === 'number' && Number.isFinite(value.avgPrice30d) && value.avgPrice30d > 0
         ? value.avgPrice30d
         : null,
+    history30d: Array.isArray(value.history30d)
+      ? value.history30d
+          .filter((point): point is PriceHistoryPoint => typeof point?.timestamp === 'string')
+          .map((point) => ({
+            timestamp: point.timestamp,
+            avgPrice:
+              typeof point.avgPrice === 'number' && Number.isFinite(point.avgPrice) && point.avgPrice > 0
+                ? point.avgPrice
+                : null,
+            itemCount:
+              typeof point.itemCount === 'number' && Number.isFinite(point.itemCount) && point.itemCount >= 0
+                ? point.itemCount
+                : null,
+          }))
+      : [],
   }
 }

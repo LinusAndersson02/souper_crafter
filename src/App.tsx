@@ -14,17 +14,19 @@ import {
   hasArtifactInputs,
 } from './calculator'
 import { loadGameData } from './dataLoader'
-import { fetchPriceBook } from './pricing'
+import { fetchPriceBook, getCachedPricePoint } from './pricing'
 import type {
   AppSettings,
   ArtifactFilter,
   BuyPriceType,
+  CachedPricePoint,
   CraftItem,
   CraftVariant,
   EnchantmentLevel,
   GameData,
   MaterialGroup,
   PlannedCraftResult,
+  PriceHistoryPoint,
   PriceBook,
   SelectedCraftPlan,
   SellTarget,
@@ -60,6 +62,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   serverRegion: 'EU',
   hasPremium: true,
   targetCity: 'Black Market',
+  transportEmvPct: 10,
+  transportSilverPerKg: 400,
   dailyBonusA: {
     category: '',
     percent: 10,
@@ -76,6 +80,8 @@ const EMPTY_PRICE_BOOK: PriceBook = {
   error: null,
 }
 
+const EMPTY_HISTORY_POINTS: PriceHistoryPoint[] = []
+
 const CURRENCY_FORMATTER = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
 })
@@ -88,6 +94,17 @@ const DECIMAL_FORMATTER = new Intl.NumberFormat('en-US', {
 const COUNT_FORMATTER = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 1,
   minimumFractionDigits: 1,
+})
+
+const HISTORY_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: 'numeric',
+})
+
+const HISTORY_FULL_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric',
 })
 
 type UnknownRecord = Record<string, unknown>
@@ -261,6 +278,15 @@ function resolveArtifactFilter(item: CraftItem): ArtifactFilter {
   return 'OTHER'
 }
 
+function formatHistoryDate(timestamp: string, includeYear = false): string {
+  const parsed = new Date(timestamp)
+  if (Number.isNaN(parsed.getTime())) {
+    return timestamp
+  }
+
+  return includeYear ? HISTORY_FULL_DATE_FORMATTER.format(parsed) : HISTORY_DATE_FORMATTER.format(parsed)
+}
+
 function buildCollapsedInfoTitle(result: PlannedCraftResult): string {
   return [
     `Return Rate: ${formatPct(result.returnRate * 100)}`,
@@ -270,6 +296,237 @@ function buildCollapsedInfoTitle(result: PlannedCraftResult): string {
     `Nutrition: ${result.stationNutrition !== null ? DECIMAL_FORMATTER.format(result.stationNutrition) : '--'}`,
     `Estimated Item Value: ${formatSilver(result.itemValuePerCraft)}`,
   ].join('\n')
+}
+
+function getCachedPoint(priceBook: PriceBook, settings: AppSettings, location: string, itemId: string): CachedPricePoint | null {
+  return getCachedPricePoint(priceBook.values, settings.serverRegion, ESTIMATE_WINDOW, location, itemId)
+}
+
+type HistoryChartPoint = PriceHistoryPoint & {
+  index: number
+  slotLeft: number
+  slotWidth: number
+  slotCenter: number
+  barX: number
+  barY: number
+  barWidth: number
+  barHeight: number
+  priceY: number | null
+}
+
+type HistoryChartModel = {
+  points: HistoryChartPoint[]
+  pricePath: string
+  selectedPriceY: number | null
+  chartBottom: number
+  chartTop: number
+}
+
+function buildPriceHistoryPath(points: HistoryChartPoint[]): string {
+  const pricedPoints = points.filter((point): point is HistoryChartPoint & { priceY: number } => point.priceY !== null)
+  if (pricedPoints.length === 0) {
+    return ''
+  }
+
+  return pricedPoints
+    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.slotCenter.toFixed(2)} ${point.priceY.toFixed(2)}`)
+    .join(' ')
+}
+
+function buildHistoryChartModel(
+  history: PriceHistoryPoint[],
+  selectedPrice: number | null,
+  width: number,
+  height: number,
+  paddingX: number,
+  paddingY: number,
+): HistoryChartModel {
+  const chartBottom = height - paddingY
+  const chartTop = paddingY
+  const innerWidth = Math.max(1, width - paddingX * 2)
+  const innerHeight = Math.max(1, height - paddingY * 2)
+  const slotWidth = history.length > 0 ? innerWidth / history.length : innerWidth
+  const barWidth = history.length > 0 ? Math.max(4, slotWidth * 0.62) : 0
+  const maxVolume = Math.max(1, ...history.map((point) => point.itemCount ?? 0))
+  const priceValues = history
+    .map((point) => point.avgPrice)
+    .filter((value): value is number => value !== null && Number.isFinite(value))
+
+  if (selectedPrice !== null && Number.isFinite(selectedPrice)) {
+    priceValues.push(selectedPrice)
+  }
+
+  const rawMinPrice = priceValues.length > 0 ? Math.min(...priceValues) : 0
+  const rawMaxPrice = priceValues.length > 0 ? Math.max(...priceValues) : 1
+  const rawRange = Math.max(rawMaxPrice - rawMinPrice, rawMaxPrice === 0 ? 1 : rawMaxPrice * 0.12)
+  const paddedMinPrice = Math.max(0, rawMinPrice - rawRange * 0.18)
+  const paddedMaxPrice = rawMaxPrice + rawRange * 0.18
+  const paddedRange = Math.max(1, paddedMaxPrice - paddedMinPrice)
+
+  const mapPriceToY = (price: number): number => chartTop + innerHeight - ((price - paddedMinPrice) / paddedRange) * innerHeight
+
+  const points: HistoryChartPoint[] = history.map((point, index) => {
+    const slotLeft = paddingX + index * slotWidth
+    const slotCenter = slotLeft + slotWidth / 2
+    const itemCount = point.itemCount ?? 0
+    const barHeight = itemCount > 0 ? (itemCount / maxVolume) * (innerHeight * 0.38) : 0
+    const barX = slotCenter - barWidth / 2
+    const barY = chartBottom - barHeight
+
+    return {
+      ...point,
+      index,
+      slotLeft,
+      slotWidth,
+      slotCenter,
+      barX,
+      barY,
+      barWidth,
+      barHeight,
+      priceY: point.avgPrice !== null && Number.isFinite(point.avgPrice) ? mapPriceToY(point.avgPrice) : null,
+    }
+  })
+
+  return {
+    points,
+    pricePath: buildPriceHistoryPath(points),
+    selectedPriceY: selectedPrice !== null && Number.isFinite(selectedPrice) ? mapPriceToY(selectedPrice) : null,
+    chartBottom,
+    chartTop,
+  }
+}
+
+function findLatestHistoryPoint(points: HistoryChartPoint[]): HistoryChartPoint | null {
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    if (points[index].avgPrice !== null || points[index].itemCount !== null) {
+      return points[index]
+    }
+  }
+
+  return points[points.length - 1] ?? null
+}
+
+function MarketHistoryCard(props: {
+  title: string
+  subtitle: string
+  location: string
+  selectedPrice: number | null
+  avgSoldPerDay30d: number | null
+  pricePoint: CachedPricePoint | null
+  plannedAmountLabel: string
+}) {
+  const { title, subtitle, location, selectedPrice, avgSoldPerDay30d, pricePoint, plannedAmountLabel } = props
+  const history = pricePoint?.history30d ?? EMPTY_HISTORY_POINTS
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
+  const chartWidth = 320
+  const chartHeight = 132
+  const chartPaddingX = 12
+  const chartPaddingY = 10
+  const chartModel = useMemo(
+    () => buildHistoryChartModel(history, selectedPrice, chartWidth, chartHeight, chartPaddingX, chartPaddingY),
+    [history, selectedPrice],
+  )
+  const activeHoveredIndex = hoveredIndex !== null && hoveredIndex < chartModel.points.length ? hoveredIndex : null
+  const hoveredPoint = activeHoveredIndex !== null ? chartModel.points[activeHoveredIndex] ?? null : null
+  const latestPoint = useMemo(() => findLatestHistoryPoint(chartModel.points), [chartModel.points])
+  const displayPoint = hoveredPoint ?? latestPoint
+  const hasHistory = history.some((point) => point.avgPrice !== null || (point.itemCount ?? 0) > 0)
+
+  return (
+    <article className="history-card">
+      <div className="history-card-header">
+        <div>
+          <h5>{title}</h5>
+          <p>{subtitle}</p>
+        </div>
+        <span>{plannedAmountLabel}</span>
+      </div>
+
+      <div className="history-card-metrics">
+        <span>Selected Price: {formatSilver(selectedPrice)}</span>
+        <span>Sold/Day: {formatCount(avgSoldPerDay30d)}</span>
+      </div>
+
+      <div className="history-hover-summary">
+        <span>{displayPoint ? formatHistoryDate(displayPoint.timestamp, true) : 'No daily history'}</span>
+        <span>Avg {formatSilver(displayPoint?.avgPrice ?? null)}</span>
+        <span>Sold {formatCount(displayPoint?.itemCount ?? null)}</span>
+      </div>
+
+      {hasHistory ? (
+        <div className="history-chart-wrap">
+          <svg className="history-chart" viewBox={`0 0 ${chartWidth} ${chartHeight}`} role="img" aria-label={`${title} market history`}>
+            <line
+              x1={chartPaddingX}
+              y1={chartModel.chartBottom}
+              x2={chartWidth - chartPaddingX}
+              y2={chartModel.chartBottom}
+            />
+            {chartModel.selectedPriceY !== null && (
+              <line
+                className="history-selected-line"
+                x1={chartPaddingX}
+                y1={chartModel.selectedPriceY}
+                x2={chartWidth - chartPaddingX}
+                y2={chartModel.selectedPriceY}
+              />
+            )}
+            {hoveredPoint && (
+              <line
+                className="history-hover-line"
+                x1={hoveredPoint.slotCenter}
+                y1={chartModel.chartTop}
+                x2={hoveredPoint.slotCenter}
+                y2={chartModel.chartBottom}
+              />
+            )}
+            {chartModel.points.map((point) => (
+              <rect
+                key={`${point.timestamp}-bar`}
+                className="history-bar"
+                x={point.barX}
+                y={point.barY}
+                width={point.barWidth}
+                height={Math.max(0, point.barHeight)}
+                rx={1.5}
+              />
+            ))}
+            {chartModel.pricePath.length > 0 && <path className="history-line" d={chartModel.pricePath} />}
+            {hoveredPoint?.priceY !== null && hoveredPoint !== null && (
+              <circle className="history-point" cx={hoveredPoint.slotCenter} cy={hoveredPoint.priceY} r={3.25} />
+            )}
+            {chartModel.points.map((point) => (
+              <rect
+                key={`${point.timestamp}-hitbox`}
+                className={`history-hitbox ${activeHoveredIndex === point.index ? 'active' : ''}`}
+                x={point.slotLeft}
+                y={chartModel.chartTop}
+                width={Math.max(8, point.slotWidth)}
+                height={chartModel.chartBottom - chartModel.chartTop}
+                tabIndex={0}
+                onMouseEnter={() => setHoveredIndex(point.index)}
+                onMouseLeave={() => setHoveredIndex(null)}
+                onFocus={() => setHoveredIndex(point.index)}
+                onBlur={() => setHoveredIndex(null)}
+                aria-label={`${formatHistoryDate(point.timestamp, true)} average price ${formatSilver(point.avgPrice)}, sold ${formatCount(point.itemCount)}`}
+              >
+                <title>
+                  {`${formatHistoryDate(point.timestamp, true)} · Avg ${formatSilver(point.avgPrice)} · Sold ${formatCount(point.itemCount)}`}
+                </title>
+              </rect>
+            ))}
+          </svg>
+        </div>
+      ) : (
+        <div className="history-chart-empty">No 30d history data</div>
+      )}
+
+      <div className="history-card-footer">
+        <span>{location}</span>
+        <span>30d history · all qualities</span>
+      </div>
+    </article>
+  )
 }
 
 function resolveRowStatus(result: { missingPrices: string[]; avgSoldPerDay30d: number | null; avgPrice30d: number | null }) {
@@ -367,6 +624,14 @@ function normalizeSettings(rawSettings: AppSettings, gameData: GameData | null):
 
   const targetCity = validSellTargets.has(rawSettings.targetCity) ? rawSettings.targetCity : 'Black Market'
   const validDailyBonusValues = new Set(DAILY_BONUS_OPTIONS.map((option) => option.value))
+  const transportEmvPct =
+    typeof rawSettings.transportEmvPct === 'number' && Number.isFinite(rawSettings.transportEmvPct)
+      ? Math.max(0, rawSettings.transportEmvPct)
+      : DEFAULT_SETTINGS.transportEmvPct
+  const transportSilverPerKg =
+    typeof rawSettings.transportSilverPerKg === 'number' && Number.isFinite(rawSettings.transportSilverPerKg)
+      ? Math.max(0, rawSettings.transportSilverPerKg)
+      : DEFAULT_SETTINGS.transportSilverPerKg
 
   const dailyBonusA =
     validDailyBonusValues.has(rawSettings.dailyBonusA?.category ?? '')
@@ -387,6 +652,8 @@ function normalizeSettings(rawSettings: AppSettings, gameData: GameData | null):
     serverRegion,
     hasPremium: typeof rawSettings.hasPremium === 'boolean' ? rawSettings.hasPremium : true,
     targetCity,
+    transportEmvPct,
+    transportSilverPerKg,
     dailyBonusA: {
       category: dailyBonusA?.category ?? '',
       percent: dailyBonusA?.percent === 20 ? 20 : 10,
@@ -835,6 +1102,7 @@ function App() {
           totalRevenue: 0,
           totalMarketFee: 0,
           totalProfit: 0,
+          totalProfitPct: null,
         },
       }
     }
@@ -860,15 +1128,26 @@ function App() {
       {
         displayName: string
         marketItemId: string
-        typeLabel: string
         buyCity: string
         quantity: number
-        recipeQuantity: number
-        returnedQuantity: number
         unitPrice: number
         totalCost: number
       }
     >()
+    const journals = new Map<
+      string,
+      {
+        label: string
+        buyCity: string
+        sellCity: string
+        amount: number
+        buyCost: number
+        sellRevenue: number
+      }
+    >()
+    let totalOutputQuantity = 0
+    let totalOutputRevenue = 0
+    let totalOutputWeight = 0
 
     for (const result of plannedView.results) {
       const outputKey = `${result.variant.marketItemId}|${result.sellCity}`
@@ -881,35 +1160,56 @@ function App() {
       }
 
       existingOutput.quantity += result.plan.quantity
-      existingOutput.revenue += result.revenue ?? 0
+      existingOutput.revenue += result.productRevenue ?? 0
       existingOutput.weight += result.baseItem.weight * result.plan.quantity
       outputs.set(outputKey, existingOutput)
+      totalOutputQuantity += result.plan.quantity
+      totalOutputRevenue += result.productRevenue ?? 0
+      totalOutputWeight += result.baseItem.weight * result.plan.quantity
 
       for (const line of result.materialLines) {
         const inputKey = `${line.marketItemId}|${line.buyCity}`
         const existingInput = inputs.get(inputKey) ?? {
           displayName: line.displayName,
           marketItemId: line.marketItemId,
-          typeLabel: line.isArtifact ? 'Artifact' : MATERIAL_GROUP_LABELS[line.materialGroup ?? 'other'],
           buyCity: line.buyCity,
           quantity: 0,
-          recipeQuantity: 0,
-          returnedQuantity: 0,
           unitPrice: line.unitPrice ?? 0,
           totalCost: 0,
         }
 
         existingInput.quantity += line.quantity
-        existingInput.recipeQuantity += line.baseQuantity
-        existingInput.returnedQuantity += line.returnedQuantity
         existingInput.totalCost += line.totalCost ?? 0
         inputs.set(inputKey, existingInput)
+      }
+
+      if (result.journalLine) {
+        const journalKey = `${result.journalLine.fullItemId}|${result.journalLine.buyCity}|${result.journalLine.sellCity}`
+        const existingJournal = journals.get(journalKey) ?? {
+          label: result.journalLine.fullDisplayName,
+          buyCity: result.journalLine.buyCity,
+          sellCity: result.journalLine.sellCity,
+          amount: 0,
+          buyCost: 0,
+          sellRevenue: 0,
+        }
+
+        existingJournal.amount += result.journalLine.amount
+        existingJournal.buyCost += result.journalLine.buyTotalCost ?? 0
+        existingJournal.sellRevenue += result.journalLine.sellTotalRevenue ?? 0
+        journals.set(journalKey, existingJournal)
       }
     }
 
     return {
       outputs: [...outputs.values()].sort((a, b) => a.label.localeCompare(b.label)),
       inputs: [...inputs.values()].sort((a, b) => a.displayName.localeCompare(b.displayName)),
+      journals: [...journals.values()].sort((a, b) => a.label.localeCompare(b.label)),
+      outputTotals: {
+        quantity: totalOutputQuantity,
+        revenue: totalOutputRevenue,
+        weight: totalOutputWeight,
+      },
     }
   }, [plannedView.results])
 
@@ -939,6 +1239,33 @@ function App() {
       }
 
       return [...previous, buildDefaultPlan(variant, baseItem, gameData, safeSettings.targetCity)]
+    })
+  }
+
+  const addAllFilteredVariants = () => {
+    if (!gameData || pickerVariants.length === 0) {
+      return
+    }
+
+    setSelectedPlans((previous) => {
+      const nextPlans = [...previous]
+      const existingVariantIds = new Set(previous.map((plan) => plan.variantId))
+
+      for (const variant of pickerVariants) {
+        if (existingVariantIds.has(variant.variantId)) {
+          continue
+        }
+
+        const baseItem = itemsById.get(variant.baseItemId)
+        if (!baseItem) {
+          continue
+        }
+
+        nextPlans.push(buildDefaultPlan(variant, baseItem, gameData, safeSettings.targetCity))
+        existingVariantIds.add(variant.variantId)
+      }
+
+      return nextPlans
     })
   }
 
@@ -1030,10 +1357,20 @@ function App() {
 
       <section className="panel picker-panel">
         <div className="panel-title-row">
-          <h2>Select Items</h2>
-          <p>
-            Showing {pickerVariants.length} variants ({filteredBaseItems.length} base items)
-          </p>
+          <div>
+            <h2>Select Items</h2>
+            <p>
+              Showing {pickerVariants.length} variants ({filteredBaseItems.length} base items)
+            </p>
+          </div>
+          <button
+            type="button"
+            className="link-btn"
+            onClick={addAllFilteredVariants}
+            disabled={pickerVariants.length === 0}
+          >
+            Add All Filtered
+          </button>
         </div>
 
         <div className="picker-filters">
@@ -1171,115 +1508,169 @@ function App() {
           </p>
         </div>
 
-        <div className="global-bar-grid">
-          <label>
-            Server Region
-            <select
-              value={safeSettings.serverRegion}
-              onChange={(event) => updateSettings('serverRegion', event.target.value as ServerRegion)}
-            >
-              <option value="EU">Europe</option>
-              <option value="US">Americas</option>
-              <option value="ASIA">Asia</option>
-            </select>
-          </label>
+        <div className="settings-sections">
+          <div className="settings-card">
+            <div className="settings-card-header">
+              <h3>Core</h3>
+              <p>Region, premium status, and default sell target.</p>
+            </div>
+            <div className="global-bar-grid">
+              <label>
+                Server Region
+                <select
+                  value={safeSettings.serverRegion}
+                  onChange={(event) => updateSettings('serverRegion', event.target.value as ServerRegion)}
+                >
+                  <option value="EU">Europe</option>
+                  <option value="US">Americas</option>
+                  <option value="ASIA">Asia</option>
+                </select>
+              </label>
 
-          <label>
-            Premium Status
-            <select
-              value={safeSettings.hasPremium ? 'premium' : 'standard'}
-              onChange={(event) => updateSettings('hasPremium', event.target.value === 'premium')}
-            >
-              <option value="premium">Premium</option>
-              <option value="standard">No Premium</option>
-            </select>
-          </label>
+              <label>
+                Premium Status
+                <select
+                  value={safeSettings.hasPremium ? 'premium' : 'standard'}
+                  onChange={(event) => updateSettings('hasPremium', event.target.value === 'premium')}
+                >
+                  <option value="premium">Premium</option>
+                  <option value="standard">No Premium</option>
+                </select>
+              </label>
 
-          <label>
-            Target City
-            <select
-              value={safeSettings.targetCity}
-              onChange={(event) => updateSettings('targetCity', event.target.value as SellTarget)}
-            >
-              {sellTargetOptions.map((target) => (
-                <option key={target} value={target}>
-                  {target}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
+              <label>
+                Target City
+                <select
+                  value={safeSettings.targetCity}
+                  onChange={(event) => updateSettings('targetCity', event.target.value as SellTarget)}
+                >
+                  {sellTargetOptions.map((target) => (
+                    <option key={target} value={target}>
+                      {target}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </div>
 
-        <div className="daily-bonus-grid">
-          <label>
-            Daily Bonus A
-            <select
-              value={safeSettings.dailyBonusA.category}
-              onChange={(event) =>
-                updateSettings('dailyBonusA', {
-                  ...safeSettings.dailyBonusA,
-                  category: event.target.value,
-                })
-              }
-            >
-              {DAILY_BONUS_OPTIONS.map((option) => (
-                <option key={`bonus-a-${option.value || 'none'}`} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="settings-card">
+            <div className="settings-card-header">
+              <h3>Transport Costs</h3>
+              <p>Black Market transport uses the higher of EMV % or silver per kg.</p>
+            </div>
+            <div className="transport-grid">
+              <label>
+                Transport EMV %
+                <input
+                  type="number"
+                  min={0}
+                  step={0.1}
+                  value={safeSettings.transportEmvPct}
+                  onChange={(event) =>
+                    updateSettings(
+                      'transportEmvPct',
+                      Math.max(0, parseNumericInput(event.target.value, safeSettings.transportEmvPct)),
+                    )
+                  }
+                />
+              </label>
 
-          <label>
-            Bonus A %
-            <select
-              value={safeSettings.dailyBonusA.percent}
-              onChange={(event) =>
-                updateSettings('dailyBonusA', {
-                  ...safeSettings.dailyBonusA,
-                  percent: Number(event.target.value) as 10 | 20,
-                })
-              }
-            >
-              <option value={10}>10%</option>
-              <option value={20}>20%</option>
-            </select>
-          </label>
+              <label>
+                Transport Silver / Kg
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={safeSettings.transportSilverPerKg}
+                  onChange={(event) =>
+                    updateSettings(
+                      'transportSilverPerKg',
+                      Math.max(0, parseNumericInput(event.target.value, safeSettings.transportSilverPerKg)),
+                    )
+                  }
+                />
+              </label>
+            </div>
+          </div>
 
-          <label>
-            Daily Bonus B
-            <select
-              value={safeSettings.dailyBonusB.category}
-              onChange={(event) =>
-                updateSettings('dailyBonusB', {
-                  ...safeSettings.dailyBonusB,
-                  category: event.target.value,
-                })
-              }
-            >
-              {DAILY_BONUS_OPTIONS.map((option) => (
-                <option key={`bonus-b-${option.value || 'none'}`} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="settings-card settings-card-wide">
+            <div className="settings-card-header">
+              <h3>Daily Bonuses</h3>
+              <p>Two optional production bonuses applied to matching craft categories.</p>
+            </div>
+            <div className="daily-bonus-grid">
+              <label>
+                Daily Bonus A
+                <select
+                  value={safeSettings.dailyBonusA.category}
+                  onChange={(event) =>
+                    updateSettings('dailyBonusA', {
+                      ...safeSettings.dailyBonusA,
+                      category: event.target.value,
+                    })
+                  }
+                >
+                  {DAILY_BONUS_OPTIONS.map((option) => (
+                    <option key={`bonus-a-${option.value || 'none'}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
 
-          <label>
-            Bonus B %
-            <select
-              value={safeSettings.dailyBonusB.percent}
-              onChange={(event) =>
-                updateSettings('dailyBonusB', {
-                  ...safeSettings.dailyBonusB,
-                  percent: Number(event.target.value) as 10 | 20,
-                })
-              }
-            >
-              <option value={10}>10%</option>
-              <option value={20}>20%</option>
-            </select>
-          </label>
+              <label>
+                Bonus A %
+                <select
+                  value={safeSettings.dailyBonusA.percent}
+                  onChange={(event) =>
+                    updateSettings('dailyBonusA', {
+                      ...safeSettings.dailyBonusA,
+                      percent: Number(event.target.value) as 10 | 20,
+                    })
+                  }
+                >
+                  <option value={10}>10%</option>
+                  <option value={20}>20%</option>
+                </select>
+              </label>
+
+              <label>
+                Daily Bonus B
+                <select
+                  value={safeSettings.dailyBonusB.category}
+                  onChange={(event) =>
+                    updateSettings('dailyBonusB', {
+                      ...safeSettings.dailyBonusB,
+                      category: event.target.value,
+                    })
+                  }
+                >
+                  {DAILY_BONUS_OPTIONS.map((option) => (
+                    <option key={`bonus-b-${option.value || 'none'}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Bonus B %
+                <select
+                  value={safeSettings.dailyBonusB.percent}
+                  onChange={(event) =>
+                    updateSettings('dailyBonusB', {
+                      ...safeSettings.dailyBonusB,
+                      percent: Number(event.target.value) as 10 | 20,
+                    })
+                  }
+                >
+                  <option value={10}>10%</option>
+                  <option value={20}>20%</option>
+                </select>
+              </label>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -1287,10 +1678,6 @@ function App() {
         <article className="summary-card">
           <h4>Planned Crafts</h4>
           <p>{plannedView.summary.plannedCrafts}</p>
-        </article>
-        <article className="summary-card">
-          <h4>Ready Prices</h4>
-          <p>{plannedView.summary.readyCrafts}</p>
         </article>
         <article className="summary-card">
           <h4>Total Cost</h4>
@@ -1303,6 +1690,10 @@ function App() {
         <article className={`summary-card ${plannedView.summary.totalProfit >= 0 ? 'profit' : 'loss'}`}>
           <h4>Total Profit</h4>
           <p>{formatSilver(plannedView.summary.totalProfit)}</p>
+        </article>
+        <article className={`summary-card ${plannedView.summary.totalProfit >= 0 ? 'profit' : 'loss'}`}>
+          <h4>Total Profit %</h4>
+          <p>{formatPct(plannedView.summary.totalProfitPct)}</p>
         </article>
       </section>
 
@@ -1357,11 +1748,8 @@ function App() {
               <thead>
                 <tr>
                   <th />
-                  <th>Craft</th>
+                  <th>Item</th>
                   <th>Qty</th>
-                  <th>Craft</th>
-                  <th>Sell</th>
-                  <th>Buy</th>
                   <th>Sold/Day</th>
                   <th>Unit Price</th>
                   <th>Total Cost</th>
@@ -1379,6 +1767,7 @@ function App() {
                   const rowStatus = resolveRowStatus(result)
                   const infoTitle = buildCollapsedInfoTitle(result)
                   const displayCategory = searchCategoryByItemId.get(result.baseItem.itemId)
+                  const outputPricePoint = getCachedPoint(priceBook, safeSettings, result.sellCity, result.variant.marketItemId)
 
                   return (
                     <Fragment key={result.plan.variantId}>
@@ -1437,9 +1826,6 @@ function App() {
                             }
                           />
                         </td>
-                        <td>{result.craftCity}</td>
-                        <td>{result.sellCity}</td>
-                        <td>{BUY_PRICE_TYPE_LABELS[result.plan.buyPriceType]}</td>
                         <td
                           title={
                             result.avgSoldPerDay30d === null
@@ -1463,15 +1849,19 @@ function App() {
 
                       {isExpanded && (
                         <tr className="planner-expand-row">
-                          <td colSpan={13}>
+                          <td colSpan={10}>
                             <div className="planner-expand-inner">
                               <div className="detail-metrics compact-metrics summary-chip-grid">
+                                <span>Craft City: {result.craftCity}</span>
+                                <span>Sell City: {result.sellCity}</span>
+                                <span>Buy Type: {BUY_PRICE_TYPE_LABELS[result.plan.buyPriceType]}</span>
                                 <span>Unit Price: {formatSilver(result.sellPriceUnit)}</span>
                                 <span>Material Cost: {formatSilver(result.materialEffectiveCost)}</span>
-                                <span>Revenue: {formatSilver(result.revenue)}</span>
+                                <span>Revenue: {formatSilver(result.productRevenue)}</span>
                                 <span>Profit/Item: {formatPerItem(result.netProfit, result.plan.quantity)}</span>
                                 <span>Profit %: {formatPct(result.marginPct)}</span>
                                 <span>Sold/Day: {formatCount(result.avgSoldPerDay30d)}</span>
+                                {result.journalLine && <span>Journal Net: {formatSilver(result.journalLine.netValue)}</span>}
                               </div>
 
                               <div className="per-craft-options primary-grid">
@@ -1579,6 +1969,41 @@ function App() {
                                 )}
                               </div>
 
+                              <div className="history-section">
+                                <h4>Output History</h4>
+                                <div className="history-grid">
+                                  <MarketHistoryCard
+                                    title={buildVariantLabel(result.variant)}
+                                    subtitle={`Sell in ${result.sellCity}`}
+                                    location={result.sellCity}
+                                    selectedPrice={result.sellPriceUnit}
+                                    avgSoldPerDay30d={result.avgSoldPerDay30d}
+                                    pricePoint={outputPricePoint}
+                                    plannedAmountLabel={`Qty ${result.plan.quantity}`}
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="history-section">
+                                <h4>Input History</h4>
+                                <div className="history-grid">
+                                  {result.materialLines.map((line) => (
+                                    <MarketHistoryCard
+                                      key={`${result.plan.variantId}-${line.marketItemId}-${line.buyCity}-history`}
+                                      title={line.displayName}
+                                      subtitle={line.isArtifact ? 'Artifact input' : MATERIAL_GROUP_LABELS[line.materialGroup ?? 'other']}
+                                      location={line.buyCity}
+                                      selectedPrice={line.unitPrice}
+                                      avgSoldPerDay30d={
+                                        getCachedPoint(priceBook, safeSettings, line.buyCity, line.marketItemId)?.avgSoldPerDay30d ?? null
+                                      }
+                                      pricePoint={getCachedPoint(priceBook, safeSettings, line.buyCity, line.marketItemId)}
+                                      plannedAmountLabel={`Need ${DECIMAL_FORMATTER.format(line.quantity)}`}
+                                    />
+                                  ))}
+                                </div>
+                              </div>
+
                               {result.missingPrices.length > 0 && (
                                 <div className="missing-block">
                                   <strong>Missing prices:</strong>
@@ -1590,6 +2015,40 @@ function App() {
                                 </div>
                               )}
 
+                              {result.journalLine && (
+                                <div className="materials-section">
+                                  <h4>Journals</h4>
+                                  <div className="materials-table-wrap">
+                                    <table className="materials-table">
+                                      <thead>
+                                        <tr>
+                                          <th>Empty Journal</th>
+                                          <th>Full Journal</th>
+                                          <th>Amount</th>
+                                          <th>Buy City</th>
+                                          <th>Sell City</th>
+                                          <th>Buy Cost</th>
+                                          <th>Sell Revenue</th>
+                                          <th>Net</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        <tr>
+                                          <td>{result.journalLine.emptyDisplayName}</td>
+                                          <td>{result.journalLine.fullDisplayName}</td>
+                                          <td>{DECIMAL_FORMATTER.format(result.journalLine.amount)}</td>
+                                          <td>{result.journalLine.buyCity}</td>
+                                          <td>{result.journalLine.sellCity}</td>
+                                          <td>{formatSilver(result.journalLine.buyTotalCost)}</td>
+                                          <td>{formatSilver(result.journalLine.sellTotalRevenue)}</td>
+                                          <td>{formatSilver(result.journalLine.netValue)}</td>
+                                        </tr>
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+                              )}
+
                               <div className="materials-section">
                                 <h4>Input Materials</h4>
                                 <div className="materials-table-wrap">
@@ -1597,11 +2056,8 @@ function App() {
                                     <thead>
                                       <tr>
                                         <th>Material</th>
-                                        <th>Type</th>
                                         <th>Buy City</th>
                                         <th>Needed</th>
-                                        <th>Recipe</th>
-                                        <th>Returned</th>
                                         <th>Unit</th>
                                         <th>Total</th>
                                       </tr>
@@ -1609,17 +2065,9 @@ function App() {
                                     <tbody>
                                       {result.materialLines.map((line) => (
                                         <tr key={`${result.plan.variantId}-${line.marketItemId}-${line.buyCity}`}>
-                                          <td>
-                                            <div className="material-name">
-                                              <strong>{line.displayName}</strong>
-                                              <span>{line.marketItemId}</span>
-                                            </div>
-                                          </td>
-                                          <td>{line.isArtifact ? 'Artifact' : MATERIAL_GROUP_LABELS[line.materialGroup ?? 'other']}</td>
+                                          <td>{line.displayName}</td>
                                           <td>{line.buyCity}</td>
                                           <td>{DECIMAL_FORMATTER.format(line.quantity)}</td>
-                                          <td>{DECIMAL_FORMATTER.format(line.baseQuantity)}</td>
-                                          <td>{DECIMAL_FORMATTER.format(line.returnedQuantity)}</td>
                                           <td>{formatSilver(line.unitPrice)}</td>
                                           <td>{formatSilver(line.totalCost)}</td>
                                         </tr>
@@ -1675,6 +2123,15 @@ function App() {
                       </tr>
                     ))}
                   </tbody>
+                  <tfoot>
+                    <tr className="table-summary-row">
+                      <td>Total</td>
+                      <td>All</td>
+                      <td>{breakdown.outputTotals.quantity}</td>
+                      <td>{formatWeight(breakdown.outputTotals.weight)}</td>
+                      <td>{formatSilver(breakdown.outputTotals.revenue)}</td>
+                    </tr>
+                  </tfoot>
                 </table>
               </div>
             </div>
@@ -1686,11 +2143,8 @@ function App() {
                   <thead>
                     <tr>
                       <th>Material</th>
-                      <th>Type</th>
                       <th>Buy City</th>
                       <th>Needed</th>
-                      <th>Recipe</th>
-                      <th>Returned</th>
                       <th>Unit</th>
                       <th>Total</th>
                     </tr>
@@ -1698,17 +2152,9 @@ function App() {
                   <tbody>
                     {breakdown.inputs.map((entry) => (
                       <tr key={`${entry.marketItemId}-${entry.buyCity}`}>
-                        <td>
-                          <div className="material-name">
-                            <strong>{entry.displayName}</strong>
-                            <span>{entry.marketItemId}</span>
-                          </div>
-                        </td>
-                        <td>{entry.typeLabel}</td>
+                        <td>{entry.displayName}</td>
                         <td>{entry.buyCity}</td>
                         <td>{DECIMAL_FORMATTER.format(entry.quantity)}</td>
-                        <td>{DECIMAL_FORMATTER.format(entry.recipeQuantity)}</td>
-                        <td>{DECIMAL_FORMATTER.format(entry.returnedQuantity)}</td>
                         <td>{formatSilver(entry.unitPrice)}</td>
                         <td>{formatSilver(entry.totalCost)}</td>
                       </tr>
@@ -1717,6 +2163,40 @@ function App() {
                 </table>
               </div>
             </div>
+
+            {breakdown.journals.length > 0 && (
+              <div className="breakdown-block">
+                <h3>Journals</h3>
+                <div className="materials-table-wrap">
+                  <table className="materials-table">
+                    <thead>
+                      <tr>
+                        <th>Journal</th>
+                        <th>Amount</th>
+                        <th>Buy City</th>
+                        <th>Sell City</th>
+                        <th>Buy Cost</th>
+                        <th>Sell Revenue</th>
+                        <th>Net</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {breakdown.journals.map((entry) => (
+                        <tr key={`${entry.label}-${entry.buyCity}-${entry.sellCity}`}>
+                          <td>{entry.label}</td>
+                          <td>{DECIMAL_FORMATTER.format(entry.amount)}</td>
+                          <td>{entry.buyCity}</td>
+                          <td>{entry.sellCity}</td>
+                          <td>{formatSilver(entry.buyCost)}</td>
+                          <td>{formatSilver(entry.sellRevenue)}</td>
+                          <td>{formatSilver(entry.sellRevenue - entry.buyCost)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </section>

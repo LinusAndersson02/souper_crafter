@@ -70,6 +70,11 @@ function parseNumber(value, fallback = 0) {
   return fallback
 }
 
+function parsePositiveNumber(value) {
+  const parsed = parseNumber(value, Number.NaN)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
 function parseItemsTextData(itemsText) {
   const nameMap = new Map()
   const knownMarketItemIds = new Set()
@@ -162,9 +167,13 @@ function isBlackMarketSellableCraft(itemId, category) {
   return false
 }
 
-function shouldExcludeCraftTarget(itemId, category) {
+function shouldExcludeCraftTarget(itemId, category, showInMarketplace = true) {
   const upperId = itemId.toUpperCase()
   const upperCategory = category.toUpperCase()
+
+  if (!showInMarketplace || upperId.includes('NON_TRADABLE') || upperId.startsWith('UNIQUE_UNLOCK_')) {
+    return true
+  }
 
   if (upperId.startsWith('QUESTITEM')) {
     return true
@@ -200,6 +209,54 @@ function shouldExcludeCraftTarget(itemId, category) {
   }
 
   return !isBlackMarketSellableCraft(itemId, category)
+}
+
+function buildRawItemIndex(itemsFile) {
+  const itemsRoot = asRecord(itemsFile.items)
+  if (!itemsRoot) {
+    return new Map()
+  }
+
+  const byId = new Map()
+
+  for (const [bucketName, bucketValue] of Object.entries(itemsRoot)) {
+    if (bucketName.startsWith('@') || bucketName === 'shopcategories') {
+      continue
+    }
+
+    for (const candidate of toArray(bucketValue)) {
+      const rawItem = asRecord(candidate)
+      if (!rawItem) {
+        continue
+      }
+
+      const itemId = typeof rawItem['@uniquename'] === 'string' ? rawItem['@uniquename'] : ''
+      if (itemId.length === 0 || byId.has(itemId)) {
+        continue
+      }
+
+      byId.set(itemId, rawItem)
+    }
+  }
+
+  return byId
+}
+
+function resolveResourceItemId(resource, rawItemsById) {
+  const itemId = typeof resource?.['@uniquename'] === 'string' ? resource['@uniquename'] : ''
+  if (!itemId) {
+    return ''
+  }
+
+  const enchantmentLevel = parseNumber(resource?.['@enchantmentlevel'], 0)
+  if (enchantmentLevel > 0 && !/_LEVEL\d+$/.test(itemId)) {
+    const levelItemId = `${itemId}_LEVEL${enchantmentLevel}`
+    if (rawItemsById.has(levelItemId)) {
+      return levelItemId
+    }
+  }
+
+  return itemId
 }
 
 function resolveMarketIdForEnchantment(baseItemId, enchantment, knownMarketItemIds) {
@@ -245,12 +302,101 @@ function chooseCraftingRequirement(rawRequirements) {
   return preferred ?? requirements[0]
 }
 
+function computeRequirementFame(requirement, rawItemsById, fameMemo) {
+  const rawRequirement = asRecord(requirement)
+  if (!rawRequirement) {
+    return 0
+  }
+
+  return toArray(rawRequirement.craftresource)
+    .map((resource) => asRecord(resource))
+    .filter(Boolean)
+    .reduce((sum, resource) => {
+      const resourceItemId = resolveResourceItemId(resource, rawItemsById)
+      if (!resourceItemId) {
+        return sum
+      }
+
+      return sum + computeItemFame(resourceItemId, rawItemsById, fameMemo) * parseNumber(resource['@count'], 0)
+    }, 0)
+}
+
+function computeItemFame(itemId, rawItemsById, fameMemo) {
+  if (!itemId) {
+    return 0
+  }
+
+  if (fameMemo.has(itemId)) {
+    return fameMemo.get(itemId)
+  }
+
+  const rawItem = rawItemsById.get(itemId)
+  if (!rawItem) {
+    fameMemo.set(itemId, 0)
+    return 0
+  }
+
+  const directFame = parsePositiveNumber(rawItem['@famevalue'])
+  const requirement = chooseCraftingRequirement(rawItem.craftingrequirements)
+  const baseFame = directFame ?? computeRequirementFame(requirement, rawItemsById, fameMemo)
+  const fameFactor =
+    parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
+    parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
+    1
+  const fameValue = baseFame * fameFactor
+
+  fameMemo.set(itemId, fameValue)
+  return fameValue
+}
+
+function parseJournalDefinitions(rawItemsById, nameMap) {
+  const journalByItemId = new Map()
+
+  for (const rawItem of rawItemsById.values()) {
+    const journalId = typeof rawItem['@uniquename'] === 'string' ? rawItem['@uniquename'] : ''
+    const craftItemFame = asRecord(asRecord(rawItem.famefillingmissions)?.craftitemfame)
+    if (!journalId || !craftItemFame) {
+      continue
+    }
+
+    const maxFame = parsePositiveNumber(rawItem['@maxfame']) ?? 0
+    if (maxFame <= 0) {
+      continue
+    }
+
+    const emptyItemId = `${journalId}_EMPTY`
+    const fullItemId = `${journalId}_FULL`
+    const journalInfo = {
+      emptyItemId,
+      emptyDisplayName: nameMap.get(emptyItemId) ?? emptyItemId,
+      fullItemId,
+      fullDisplayName: nameMap.get(fullItemId) ?? fullItemId,
+      maxFame,
+    }
+
+    for (const rawValidItem of toArray(craftItemFame.validitem)) {
+      const validItem = asRecord(rawValidItem)
+      const validItemId = typeof validItem?.['@id'] === 'string' ? validItem['@id'] : ''
+      if (!validItemId) {
+        continue
+      }
+
+      journalByItemId.set(validItemId, journalInfo)
+    }
+  }
+
+  return journalByItemId
+}
+
 function parseItems(itemsFile, nameMap, knownMarketItemIds) {
   const itemsRoot = asRecord(itemsFile.items)
   if (!itemsRoot) {
     return []
   }
 
+  const rawItemsById = buildRawItemIndex(itemsFile)
+  const fameMemo = new Map()
+  const journalDefinitions = parseJournalDefinitions(rawItemsById, nameMap)
   const byId = new Map()
 
   for (const [bucketName, bucketValue] of Object.entries(itemsRoot)) {
@@ -270,7 +416,8 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
       }
 
       const craftingCategory = normalizeCategory(rawItem)
-      if (shouldExcludeCraftTarget(itemId, craftingCategory)) {
+      const showInMarketplace = rawItem['@showinmarketplace'] !== 'false'
+      if (shouldExcludeCraftTarget(itemId, craftingCategory, showInMarketplace)) {
         continue
       }
 
@@ -295,9 +442,37 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
       }
 
       const availableEnchantments = [0]
+      const journalDefinition = journalDefinitions.get(itemId) ?? null
+      const fameByEnchantment = {}
+      if (journalDefinition) {
+        fameByEnchantment[0] = computeItemFame(itemId, rawItemsById, fameMemo)
+      }
+
       for (const enchantment of [1, 2, 3, 4]) {
         if (resolveMarketIdForEnchantment(itemId, enchantment, knownMarketItemIds)) {
           availableEnchantments.push(enchantment)
+        }
+      }
+
+      if (journalDefinition) {
+        for (const rawEnchantment of toArray(asRecord(rawItem.enchantments)?.enchantment)) {
+          const enchantmentEntry = asRecord(rawEnchantment)
+          if (!enchantmentEntry) {
+            continue
+          }
+
+          const enchantmentLevel = parseNumber(enchantmentEntry['@enchantmentlevel'], Number.NaN)
+          if (!Number.isFinite(enchantmentLevel) || enchantmentLevel < 1 || enchantmentLevel > 4) {
+            continue
+          }
+
+          const enchantmentRequirement = chooseCraftingRequirement(enchantmentEntry.craftingrequirements)
+          const baseFame = computeRequirementFame(enchantmentRequirement, rawItemsById, fameMemo)
+          const fameFactor =
+            parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
+            parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
+            1
+          fameByEnchantment[enchantmentLevel] = baseFame * fameFactor
         }
       }
 
@@ -312,6 +487,12 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
         itemValue: parseNumber(rawItem['@itemvalue'], 0),
         recipe,
         availableEnchantments,
+        journal: journalDefinition
+          ? {
+              ...journalDefinition,
+              fameByEnchantment,
+            }
+          : null,
       })
     }
   }

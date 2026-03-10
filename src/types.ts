@@ -37,6 +37,16 @@ export interface CraftItem {
   itemValue: number
   recipe: RecipeResource[]
   availableEnchantments: EnchantmentLevel[]
+  journal: CraftJournalInfo | null
+}
+
+export interface CraftJournalInfo {
+  emptyItemId: string
+  emptyDisplayName: string
+  fullItemId: string
+  fullDisplayName: string
+  maxFame: number
+  fameByEnchantment: Partial<Record<EnchantmentLevel, number>>
 }
 
 export interface CraftVariant {
@@ -81,6 +91,12 @@ export interface DailyBonusSetting {
   percent: 10 | 20
 }
 
+export interface PriceHistoryPoint {
+  timestamp: string
+  avgPrice: number | null
+  itemCount: number | null
+}
+
 export interface AppSettings {
   search: string
   tierFilters: number[]
@@ -90,6 +106,8 @@ export interface AppSettings {
   serverRegion: ServerRegion
   hasPremium: boolean
   targetCity: SellTarget
+  transportEmvPct: number
+  transportSilverPerKg: number
   dailyBonusA: DailyBonusSetting
   dailyBonusB: DailyBonusSetting
 }
@@ -100,6 +118,7 @@ export interface CachedPricePoint {
   buyOrder: number | null
   avgSoldPerDay30d: number | null
   avgPrice30d: number | null
+  history30d: PriceHistoryPoint[]
 }
 
 export interface PriceBook {
@@ -122,6 +141,23 @@ export interface MaterialCostLine {
   isArtifact: boolean
 }
 
+export interface JournalLine {
+  amount: number
+  buyCity: string
+  sellCity: string
+  emptyItemId: string
+  emptyDisplayName: string
+  fullItemId: string
+  fullDisplayName: string
+  famePerCraft: number
+  journalMaxFame: number
+  buyUnitPrice: number | null
+  sellUnitPrice: number | null
+  buyTotalCost: number | null
+  sellTotalRevenue: number | null
+  netValue: number | null
+}
+
 export interface PlannedCraftResult {
   plan: SelectedCraftPlan
   variant: CraftVariant
@@ -130,6 +166,7 @@ export interface PlannedCraftResult {
   sellCity: SellTarget
   returnRate: number
   materialLines: MaterialCostLine[]
+  journalLine: JournalLine | null
   missingPrices: string[]
   estimatedMarketValue: number | null
   sellPriceUnit: number | null
@@ -137,6 +174,9 @@ export interface PlannedCraftResult {
   avgPrice30d: number | null
   materialBaseCost: number | null
   materialEffectiveCost: number | null
+  productRevenue: number | null
+  journalCost: number | null
+  journalRevenue: number | null
   itemValuePerCraft: number | null
   stationNutrition: number | null
   marketFee: number | null
@@ -154,6 +194,7 @@ export interface CraftPlanSummary {
   totalRevenue: number
   totalMarketFee: number
   totalProfit: number
+  totalProfitPct: number | null
 }
 
 export interface PlannedCraftView {

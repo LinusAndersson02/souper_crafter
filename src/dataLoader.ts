@@ -91,9 +91,18 @@ function parseNumber(value: unknown, fallback = 0): number {
   return fallback
 }
 
-function shouldExcludeCraftTarget(itemId: string, category: string): boolean {
+function parsePositiveNumber(value: unknown): number | null {
+  const parsed = parseNumber(value, Number.NaN)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+function shouldExcludeCraftTarget(itemId: string, category: string, showInMarketplace = true): boolean {
   const upperId = itemId.toUpperCase()
   const upperCategory = category.toUpperCase()
+
+  if (!showInMarketplace || upperId.includes('NON_TRADABLE') || upperId.startsWith('UNIQUE_UNLOCK_')) {
+    return true
+  }
 
   if (upperId.startsWith('QUESTITEM')) {
     return true
@@ -129,6 +138,54 @@ function shouldExcludeCraftTarget(itemId: string, category: string): boolean {
   }
 
   return !isBlackMarketSellableCraft(itemId, category)
+}
+
+function buildRawItemIndex(itemsFile: ItemsFile): Map<string, UnknownRecord> {
+  const itemsRoot = asRecord(itemsFile.items)
+  if (!itemsRoot) {
+    return new Map()
+  }
+
+  const byId = new Map<string, UnknownRecord>()
+
+  for (const [bucketName, bucketValue] of Object.entries(itemsRoot)) {
+    if (bucketName.startsWith('@') || bucketName === 'shopcategories') {
+      continue
+    }
+
+    for (const candidate of toArray(bucketValue)) {
+      const rawItem = asRecord(candidate)
+      if (!rawItem) {
+        continue
+      }
+
+      const itemId = typeof rawItem['@uniquename'] === 'string' ? rawItem['@uniquename'] : ''
+      if (itemId.length === 0 || byId.has(itemId)) {
+        continue
+      }
+
+      byId.set(itemId, rawItem)
+    }
+  }
+
+  return byId
+}
+
+function resolveResourceItemId(resource: UnknownRecord, rawItemsById: Map<string, UnknownRecord>): string {
+  const itemId = typeof resource['@uniquename'] === 'string' ? resource['@uniquename'] : ''
+  if (itemId.length === 0) {
+    return ''
+  }
+
+  const enchantmentLevel = parseNumber(resource['@enchantmentlevel'], 0)
+  if (enchantmentLevel > 0 && !/_LEVEL\d+$/.test(itemId)) {
+    const levelItemId = `${itemId}_LEVEL${enchantmentLevel}`
+    if (rawItemsById.has(levelItemId)) {
+      return levelItemId
+    }
+  }
+
+  return itemId
 }
 
 function isBlackMarketSellableCraft(itemId: string, category: string): boolean {
@@ -310,6 +367,116 @@ function chooseCraftingRequirement(rawRequirements: unknown): UnknownRecord | nu
   return preferred ?? requirements[0]
 }
 
+function computeRequirementFame(
+  requirement: UnknownRecord | null,
+  rawItemsById: Map<string, UnknownRecord>,
+  fameMemo: Map<string, number>,
+): number {
+  if (!requirement) {
+    return 0
+  }
+
+  return toArray(requirement.craftresource)
+    .map((resource) => asRecord(resource))
+    .filter((resource): resource is UnknownRecord => resource !== null)
+    .reduce((sum, resource) => {
+      const resourceItemId = resolveResourceItemId(resource, rawItemsById)
+      if (resourceItemId.length === 0) {
+        return sum
+      }
+
+      return sum + computeItemFame(resourceItemId, rawItemsById, fameMemo) * parseNumber(resource['@count'], 0)
+    }, 0)
+}
+
+function computeItemFame(
+  itemId: string,
+  rawItemsById: Map<string, UnknownRecord>,
+  fameMemo: Map<string, number>,
+): number {
+  if (fameMemo.has(itemId)) {
+    return fameMemo.get(itemId) ?? 0
+  }
+
+  const rawItem = rawItemsById.get(itemId)
+  if (!rawItem) {
+    fameMemo.set(itemId, 0)
+    return 0
+  }
+
+  const directFame = parsePositiveNumber(rawItem['@famevalue'])
+  const requirement = chooseCraftingRequirement(rawItem.craftingrequirements)
+  const baseFame = directFame ?? computeRequirementFame(requirement, rawItemsById, fameMemo)
+  const fameFactor =
+    parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
+    parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
+    1
+  const fameValue = baseFame * fameFactor
+
+  fameMemo.set(itemId, fameValue)
+  return fameValue
+}
+
+function parseJournalDefinitions(
+  rawItemsById: Map<string, UnknownRecord>,
+  nameMap: Map<string, string>,
+): Map<
+  string,
+  {
+    emptyItemId: string
+    emptyDisplayName: string
+    fullItemId: string
+    fullDisplayName: string
+    maxFame: number
+  }
+> {
+  const journalByItemId = new Map<
+    string,
+    {
+      emptyItemId: string
+      emptyDisplayName: string
+      fullItemId: string
+      fullDisplayName: string
+      maxFame: number
+    }
+  >()
+
+  for (const rawItem of rawItemsById.values()) {
+    const journalId = typeof rawItem['@uniquename'] === 'string' ? rawItem['@uniquename'] : ''
+    const craftItemFame = asRecord(asRecord(rawItem.famefillingmissions)?.craftitemfame)
+    if (journalId.length === 0 || !craftItemFame) {
+      continue
+    }
+
+    const maxFame = parsePositiveNumber(rawItem['@maxfame']) ?? 0
+    if (maxFame <= 0) {
+      continue
+    }
+
+    const emptyItemId = `${journalId}_EMPTY`
+    const fullItemId = `${journalId}_FULL`
+    const journalDefinition = {
+      emptyItemId,
+      emptyDisplayName: nameMap.get(emptyItemId) ?? emptyItemId,
+      fullItemId,
+      fullDisplayName: nameMap.get(fullItemId) ?? fullItemId,
+      maxFame,
+    }
+
+    for (const rawValidItem of toArray(craftItemFame.validitem)) {
+      const validItem = asRecord(rawValidItem)
+      const validItemId = typeof validItem?.['@id'] === 'string' ? validItem['@id'] : ''
+      if (validItemId.length === 0) {
+        continue
+      }
+
+      journalByItemId.set(validItemId, journalDefinition)
+    }
+  }
+
+  return journalByItemId
+}
+
 function normalizeCraftItem(item: unknown): CraftItem | null {
   const raw = asRecord(item)
   if (!raw) {
@@ -341,6 +508,20 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
   }
 
   const parsedTier = parseNumber(raw.tier, Number.NaN)
+  const rawJournal = asRecord(raw.journal)
+  const rawFameByEnchantment = asRecord(rawJournal?.fameByEnchantment)
+  const fameByEnchantment: Partial<Record<EnchantmentLevel, number>> = {}
+
+  if (rawFameByEnchantment) {
+    for (const [key, value] of Object.entries(rawFameByEnchantment)) {
+      const enchantment = parseNumber(key, Number.NaN)
+      if (!Number.isFinite(enchantment) || enchantment < 0 || enchantment > 4) {
+        continue
+      }
+
+      fameByEnchantment[enchantment as EnchantmentLevel] = parseNumber(value, 0)
+    }
+  }
 
   return {
     itemId,
@@ -351,6 +532,17 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
     itemValue: parseNumber(raw.itemValue, 0),
     recipe,
     availableEnchantments: [0],
+    journal: rawJournal
+      ? {
+          emptyItemId: typeof rawJournal.emptyItemId === 'string' ? rawJournal.emptyItemId : '',
+          emptyDisplayName:
+            typeof rawJournal.emptyDisplayName === 'string' ? rawJournal.emptyDisplayName : '',
+          fullItemId: typeof rawJournal.fullItemId === 'string' ? rawJournal.fullItemId : '',
+          fullDisplayName: typeof rawJournal.fullDisplayName === 'string' ? rawJournal.fullDisplayName : '',
+          maxFame: parseNumber(rawJournal.maxFame, 0),
+          fameByEnchantment,
+        }
+      : null,
   }
 }
 
@@ -381,6 +573,9 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
     return []
   }
 
+  const rawItemsById = buildRawItemIndex(itemsFile)
+  const fameMemo = new Map<string, number>()
+  const journalDefinitions = parseJournalDefinitions(rawItemsById, nameMap)
   const byItemId = new Map<string, CraftItem>()
 
   for (const [bucketName, bucketValue] of Object.entries(itemsRoot)) {
@@ -400,7 +595,8 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
       }
 
       const craftingCategory = normalizeCategory(rawItem)
-      if (shouldExcludeCraftTarget(itemId, craftingCategory)) {
+      const showInMarketplace = rawItem['@showinmarketplace'] !== 'false'
+      if (shouldExcludeCraftTarget(itemId, craftingCategory, showInMarketplace)) {
         continue
       }
 
@@ -410,6 +606,34 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
       }
 
       const tierValue = parseNumber(rawItem['@tier'], Number.NaN)
+      const journalDefinition = journalDefinitions.get(itemId) ?? null
+      const fameByEnchantment: Partial<Record<EnchantmentLevel, number>> = {}
+      if (journalDefinition) {
+        fameByEnchantment[0] = computeItemFame(itemId, rawItemsById, fameMemo)
+      }
+
+      if (journalDefinition) {
+        for (const rawEnchantment of toArray(asRecord(rawItem.enchantments)?.enchantment)) {
+          const enchantmentEntry = asRecord(rawEnchantment)
+          if (!enchantmentEntry) {
+            continue
+          }
+
+          const enchantmentLevel = parseNumber(enchantmentEntry['@enchantmentlevel'], Number.NaN)
+          if (!Number.isFinite(enchantmentLevel) || enchantmentLevel < 1 || enchantmentLevel > 4) {
+            continue
+          }
+
+          const enchantmentRequirement = chooseCraftingRequirement(enchantmentEntry.craftingrequirements)
+          const baseFame = computeRequirementFame(enchantmentRequirement, rawItemsById, fameMemo)
+          const fameFactor =
+            parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
+            parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
+            1
+          fameByEnchantment[enchantmentLevel as EnchantmentLevel] = baseFame * fameFactor
+        }
+      }
+
       byItemId.set(itemId, {
         itemId,
         displayName: nameMap.get(itemId) ?? itemId,
@@ -419,6 +643,12 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
         itemValue: parseNumber(rawItem['@itemvalue'], 0),
         recipe,
         availableEnchantments: [0],
+        journal: journalDefinition
+          ? {
+              ...journalDefinition,
+              fameByEnchantment,
+            }
+          : null,
       })
     }
   }

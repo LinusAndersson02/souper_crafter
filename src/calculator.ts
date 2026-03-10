@@ -6,6 +6,7 @@ import type {
   CraftItem,
   CraftVariant,
   EnchantmentLevel,
+  JournalLine,
   MaterialCostLine,
   MaterialGroup,
   PlannedCraftResult,
@@ -233,6 +234,24 @@ function resolveAveragePrice30d(
   return getPricePoint(priceBook, settings, location, itemId)?.avgPrice30d ?? null
 }
 
+function resolveOutputSaleUnitPrice(
+  priceBook: PriceBook,
+  settings: AppSettings,
+  location: string,
+  itemId: string,
+  preferBlackMarketOrder: boolean,
+): number {
+  const pricePoint = getPricePoint(priceBook, settings, location, itemId)
+
+  return (
+    pricePoint?.estimated ??
+    (preferBlackMarketOrder
+      ? pricePoint?.buyOrder ?? null
+      : pricePoint?.sellOrder ?? pricePoint?.buyOrder ?? null) ??
+    0
+  )
+}
+
 function resolveMaterialPurchaseUnitPrice(
   priceBook: PriceBook,
   settings: AppSettings,
@@ -317,6 +336,18 @@ export function getMaterialGroupsForItem(baseItem: CraftItem): MaterialGroup[] {
 
 export function hasArtifactInputs(baseItem: CraftItem): boolean {
   return baseItem.recipe.some((resource) => isArtifactItem(resource.itemId))
+}
+
+function getJournalFameForPlan(baseItem: CraftItem, enchantment: EnchantmentLevel): number {
+  if (!baseItem.journal) {
+    return 0
+  }
+
+  return (
+    baseItem.journal.fameByEnchantment[enchantment] ??
+    baseItem.journal.fameByEnchantment[0] ??
+    0
+  )
 }
 
 function resolveCraftCityProfile(
@@ -432,6 +463,11 @@ export function collectRequiredPriceItemIds(params: {
     for (const resource of baseItem.recipe) {
       requiredIds.add(resolveResourceMarketItemId(resource.itemId, plan.enchantment, knownMarketItemIds))
     }
+
+    if (baseItem.journal) {
+      requiredIds.add(baseItem.journal.emptyItemId)
+      requiredIds.add(baseItem.journal.fullItemId)
+    }
   }
 
   return [...requiredIds]
@@ -493,13 +529,13 @@ function calculateSinglePlan(params: {
     }
   })
 
-  const sellPricePoint = getPricePoint(priceBook, settings, sellCity, variant.marketItemId)
-  const sellPriceUnit =
-    sellPricePoint?.estimated ??
-    (sellCity === 'Black Market'
-      ? sellPricePoint?.buyOrder ?? null
-      : sellPricePoint?.sellOrder ?? sellPricePoint?.buyOrder ?? null) ??
-    0
+  const sellPriceUnit = resolveOutputSaleUnitPrice(
+    priceBook,
+    settings,
+    sellCity,
+    variant.marketItemId,
+    sellCity === 'Black Market',
+  )
   const avgSoldPerDay30d = resolveAverageSoldPerDay(priceBook, settings, sellCity, variant.marketItemId)
   const avgPrice30d = resolveAveragePrice30d(priceBook, settings, sellCity, variant.marketItemId)
   const craftCityPrice = resolveEstimatedPrice(priceBook, settings, craftCity, variant.marketItemId)
@@ -509,13 +545,53 @@ function calculateSinglePlan(params: {
   const missingPrices: string[] = []
 
   if (!outputIdResolved && plan.enchantment > 0) {
-    missingPrices.push(`No valid market ID for ${baseItem.itemId} .${plan.enchantment}`)
+    missingPrices.push(`No market variant found for ${baseItem.displayName} [${buildTierLabel(baseItem.tier, plan.enchantment)}]`)
   }
 
   const materialEffectiveCost = sumNullable(materialLines.map((line) => line.totalCost))
   const materialBaseCost = sumNullable(
     materialLines.map((line) => (line.unitPrice ?? 0) * line.baseQuantity),
   )
+  const journalFamePerCraft = getJournalFameForPlan(baseItem, plan.enchantment)
+  const journalAmount =
+    baseItem.journal && baseItem.journal.maxFame > 0 ? (journalFamePerCraft / baseItem.journal.maxFame) * quantity : 0
+  const journalBuyCity = craftCity
+  const journalSellCity = craftCity
+  const journalBuyUnitPrice =
+    baseItem.journal && journalAmount > 0
+      ? resolveMaterialPurchaseUnitPrice(
+          priceBook,
+          settings,
+          plan.buyPriceType,
+          journalBuyCity,
+          baseItem.journal.emptyItemId,
+        )
+      : null
+  const journalSellUnitPrice =
+    baseItem.journal && journalAmount > 0
+      ? resolveOutputSaleUnitPrice(priceBook, settings, journalSellCity, baseItem.journal.fullItemId, false)
+      : null
+  const journalLine: JournalLine | null =
+    baseItem.journal && journalAmount > 0
+      ? {
+          amount: journalAmount,
+          buyCity: journalBuyCity,
+          sellCity: journalSellCity,
+          emptyItemId: baseItem.journal.emptyItemId,
+          emptyDisplayName: baseItem.journal.emptyDisplayName,
+          fullItemId: baseItem.journal.fullItemId,
+          fullDisplayName: baseItem.journal.fullDisplayName,
+          famePerCraft: journalFamePerCraft,
+          journalMaxFame: baseItem.journal.maxFame,
+          buyUnitPrice: journalBuyUnitPrice ?? 0,
+          sellUnitPrice: journalSellUnitPrice ?? 0,
+          buyTotalCost: (journalBuyUnitPrice ?? 0) * journalAmount,
+          sellTotalRevenue: (journalSellUnitPrice ?? 0) * journalAmount,
+          netValue: ((journalSellUnitPrice ?? 0) - (journalBuyUnitPrice ?? 0)) * journalAmount,
+        }
+      : null
+  const journalCost = journalLine?.buyTotalCost ?? 0
+  const journalRevenue = journalLine?.sellTotalRevenue ?? 0
 
   const estimatedMarketValue = craftCityPrice ?? sellPriceUnit
   const transportReferenceValue = craftCityPrice30d ?? sellCityPrice30d ?? 0
@@ -531,16 +607,20 @@ function calculateSinglePlan(params: {
     itemValuePerCraft !== null ? itemValuePerCraft * TOTAL_NUTRITION_PER_ITEM_VALUE * quantity : null
 
   const marketTaxPct = getMarketListingTaxPct(settings.hasPremium) + getMarketSalesTaxPct()
-  const revenue = sellPriceUnit * quantity
+  const productRevenue = sellPriceUnit * quantity
+  const revenue = productRevenue + journalRevenue
   const marketFee = revenue !== null ? revenue * (marketTaxPct / 100) : null
 
   const transportFee =
     sellCity === 'Black Market'
-      ? Math.max(transportReferenceValue * quantity * 0.1, Math.max(0, baseItem.weight * quantity) * 400)
+      ? Math.max(
+          transportReferenceValue * quantity * (Math.max(0, settings.transportEmvPct) / 100),
+          Math.max(0, baseItem.weight * quantity) * Math.max(0, settings.transportSilverPerKg),
+        )
       : 0
 
   const totalCost =
-    materialEffectiveCost !== null && transportFee !== null ? materialEffectiveCost + transportFee : null
+    materialEffectiveCost !== null && transportFee !== null ? materialEffectiveCost + journalCost + transportFee : null
 
   const netProfit =
     revenue !== null && marketFee !== null && totalCost !== null ? revenue - marketFee - totalCost : null
@@ -555,6 +635,7 @@ function calculateSinglePlan(params: {
     sellCity,
     returnRate,
     materialLines,
+    journalLine,
     missingPrices: deduplicate(missingPrices),
     estimatedMarketValue,
     sellPriceUnit,
@@ -562,6 +643,9 @@ function calculateSinglePlan(params: {
     avgPrice30d,
     materialBaseCost,
     materialEffectiveCost,
+    productRevenue,
+    journalCost,
+    journalRevenue,
     itemValuePerCraft,
     stationNutrition,
     marketFee,
@@ -616,7 +700,10 @@ export function calculatePlannedCrafts(params: {
     totalRevenue: readyResults.reduce((sum, result) => sum + (result.revenue ?? 0), 0),
     totalMarketFee: readyResults.reduce((sum, result) => sum + (result.marketFee ?? 0), 0),
     totalProfit: readyResults.reduce((sum, result) => sum + (result.netProfit ?? 0), 0),
+    totalProfitPct: null as number | null,
   }
+
+  summary.totalProfitPct = summary.totalCost > 0 ? (summary.totalProfit / summary.totalCost) * 100 : null
 
   return {
     results,
