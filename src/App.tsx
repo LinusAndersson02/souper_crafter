@@ -476,33 +476,6 @@ function normalizeSearchCategory(item: CraftItem): string | null {
   return null
 }
 
-function resolveArtifactFilter(item: CraftItem): ArtifactFilter {
-  const artifactInput = item.recipe.find((resource) => resource.itemId.toUpperCase().includes('ARTEFACT'))
-  if (!artifactInput) {
-    return 'NON_ARTIFACT'
-  }
-
-  const normalizedArtifactId = artifactInput.itemId.toUpperCase()
-
-  if (normalizedArtifactId.includes('_KEEPER') || normalizedArtifactId.includes('_HERETIC')) {
-    return 'RUNE'
-  }
-
-  if (normalizedArtifactId.includes('_UNDEAD')) {
-    return 'SOUL'
-  }
-
-  if (
-    normalizedArtifactId.includes('_HELL') ||
-    normalizedArtifactId.includes('_MORGANA') ||
-    normalizedArtifactId.includes('_DEMON')
-  ) {
-    return 'RELIC'
-  }
-
-  return 'OTHER'
-}
-
 function formatHistoryDate(timestamp: string, includeYear = false): string {
   const parsed = new Date(timestamp)
   if (Number.isNaN(parsed.getTime())) {
@@ -1308,7 +1281,7 @@ function App() {
       return new Map<string, ArtifactFilter>()
     }
 
-    return new Map(gameData.items.map((item) => [item.itemId, resolveArtifactFilter(item)]))
+    return new Map(gameData.items.map((item) => [item.itemId, item.artifactFilter]))
   }, [gameData])
 
   const categoryOptions = useMemo(() => {

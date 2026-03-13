@@ -1,5 +1,6 @@
 import {
   ROYAL_CLUSTER_IDS,
+  type ArtifactFilter,
   type CityProfile,
   type CraftItem,
   type EnchantmentLevel,
@@ -31,6 +32,8 @@ interface CleanDataFile {
 
 const FALLBACK_CATEGORY = 'uncategorized'
 const ENCHANTMENT_LEVELS: EnchantmentLevel[] = [1, 2, 3, 4]
+const ARTIFACT_FILTER_VALUES: ArtifactFilter[] = ['NON_ARTIFACT', 'RUNE', 'SOUL', 'RELIC', 'OTHER']
+const ARTIFACT_FILTER_SET = new Set<ArtifactFilter>(ARTIFACT_FILTER_VALUES)
 const BLACK_MARKET_CATEGORY_ALLOWLIST = new Set([
   'axe',
   'arcanestaff',
@@ -98,6 +101,72 @@ function parseNumber(value: unknown, fallback = 0): number {
 function parsePositiveNumber(value: unknown): number | null {
   const parsed = parseNumber(value, Number.NaN)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+function normalizeArtifactFilterValue(value: unknown): ArtifactFilter | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const normalizedValue = value.trim().toUpperCase()
+  return ARTIFACT_FILTER_SET.has(normalizedValue as ArtifactFilter) ? (normalizedValue as ArtifactFilter) : null
+}
+
+function hasArtifactResource(recipe: RecipeResource[]): boolean {
+  return recipe.some((resource) => resource.itemId.toUpperCase().includes('ARTEFACT'))
+}
+
+function mapArtifactMaterialToFilter(itemId: string): ArtifactFilter {
+  const normalizedItemId = itemId.toUpperCase()
+
+  if (normalizedItemId.includes('_RUNE')) {
+    return 'RUNE'
+  }
+
+  if (normalizedItemId.includes('_SOUL')) {
+    return 'SOUL'
+  }
+
+  if (normalizedItemId.includes('_RELIC')) {
+    return 'RELIC'
+  }
+
+  return 'OTHER'
+}
+
+function resolveArtifactFilterFromArtifactItem(
+  artifactItemId: string,
+  rawItemsById: Map<string, UnknownRecord>,
+): ArtifactFilter {
+  const rawArtifactItem = rawItemsById.get(artifactItemId)
+  if (!rawArtifactItem) {
+    return 'OTHER'
+  }
+
+  const artifactRequirement = chooseCraftingRequirement(rawArtifactItem.craftingrequirements)
+  const artifactMaterialId = toArray(artifactRequirement?.craftresource)
+    .map((resource) => asRecord(resource))
+    .filter((resource): resource is UnknownRecord => resource !== null)
+    .map((resource) => resolveResourceItemId(resource, rawItemsById))
+    .find((itemId) => itemId.length > 0 && !itemId.toUpperCase().includes('ARTEFACT_TOKEN_FAVOR'))
+
+  if (!artifactMaterialId) {
+    return 'OTHER'
+  }
+
+  return mapArtifactMaterialToFilter(artifactMaterialId)
+}
+
+function resolveArtifactFilterFromRecipe(
+  recipe: RecipeResource[],
+  rawItemsById: Map<string, UnknownRecord>,
+): ArtifactFilter {
+  const artifactInput = recipe.find((resource) => resource.itemId.toUpperCase().includes('ARTEFACT'))
+  if (!artifactInput) {
+    return 'NON_ARTIFACT'
+  }
+
+  return resolveArtifactFilterFromArtifactItem(artifactInput.itemId, rawItemsById)
 }
 
 function shouldExcludeCraftTarget(itemId: string, category: string, showInMarketplace = true): boolean {
@@ -570,6 +639,9 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
     return null
   }
 
+  const artifactFilter =
+    normalizeArtifactFilterValue(raw.artifactFilter) ?? (hasArtifactResource(recipe) ? 'OTHER' : 'NON_ARTIFACT')
+
   const parsedTier = parseNumber(raw.tier, Number.NaN)
   const rawJournal = asRecord(raw.journal)
   const rawFameByEnchantment = asRecord(rawJournal?.fameByEnchantment)
@@ -608,6 +680,7 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
     displayName: displayName.length > 0 ? displayName : itemId,
     tier: Number.isFinite(parsedTier) ? parsedTier : null,
     craftingCategory: category,
+    artifactFilter,
     weight: parseNumber(raw.weight, 0),
     itemValue: parseNumber(raw.itemValue, 0),
     itemValueByEnchantment,
@@ -729,6 +802,8 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
         continue
       }
 
+      const artifactFilter = resolveArtifactFilterFromRecipe(recipe, rawItemsById)
+
       const tierValue = parseNumber(rawItem['@tier'], Number.NaN)
       const journalDefinition = journalDefinitions.get(itemId) ?? null
       const fameByEnchantment: Partial<Record<EnchantmentLevel, number>> = {}
@@ -771,6 +846,7 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
         displayName: nameMap.get(itemId) ?? itemId,
         tier: Number.isFinite(tierValue) ? tierValue : null,
         craftingCategory,
+        artifactFilter,
         weight: parseNumber(rawItem['@weight'], 0),
         itemValue: itemValueByEnchantment[0] ?? parseNumber(rawItem['@itemvalue'], 0),
         itemValueByEnchantment,

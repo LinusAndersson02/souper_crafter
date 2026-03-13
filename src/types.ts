@@ -33,6 +33,7 @@ export interface CraftItem {
   displayName: string
   tier: number | null
   craftingCategory: string
+  artifactFilter: ArtifactFilter
   weight: number
   itemValue: number
   itemValueByEnchantment: Partial<Record<EnchantmentLevel, number>>

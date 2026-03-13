@@ -76,6 +76,53 @@ function parsePositiveNumber(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null
 }
 
+function mapArtifactMaterialToFilter(itemId) {
+  const normalizedItemId = itemId.toUpperCase()
+
+  if (normalizedItemId.includes('_RUNE')) {
+    return 'RUNE'
+  }
+
+  if (normalizedItemId.includes('_SOUL')) {
+    return 'SOUL'
+  }
+
+  if (normalizedItemId.includes('_RELIC')) {
+    return 'RELIC'
+  }
+
+  return 'OTHER'
+}
+
+function resolveArtifactFilterFromArtifactItem(artifactItemId, rawItemsById) {
+  const rawArtifactItem = rawItemsById.get(artifactItemId)
+  if (!rawArtifactItem) {
+    return 'OTHER'
+  }
+
+  const artifactRequirement = chooseCraftingRequirement(rawArtifactItem.craftingrequirements)
+  const artifactMaterialId = toArray(artifactRequirement?.craftresource)
+    .map((resource) => asRecord(resource))
+    .filter(Boolean)
+    .map((resource) => resolveResourceItemId(resource, rawItemsById))
+    .find((itemId) => itemId.length > 0 && !itemId.toUpperCase().includes('ARTEFACT_TOKEN_FAVOR'))
+
+  if (!artifactMaterialId) {
+    return 'OTHER'
+  }
+
+  return mapArtifactMaterialToFilter(artifactMaterialId)
+}
+
+function resolveArtifactFilterFromRecipe(recipe, rawItemsById) {
+  const artifactInput = recipe.find((resource) => resource.itemId.toUpperCase().includes('ARTEFACT'))
+  if (!artifactInput) {
+    return 'NON_ARTIFACT'
+  }
+
+  return resolveArtifactFilterFromArtifactItem(artifactInput.itemId, rawItemsById)
+}
+
 function parseItemsTextData(itemsText) {
   const nameMap = new Map()
   const knownMarketItemIds = new Set()
@@ -500,6 +547,8 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
         continue
       }
 
+      const artifactFilter = resolveArtifactFilterFromRecipe(recipe, rawItemsById)
+
       const availableEnchantments = [0]
       const journalDefinition = journalDefinitions.get(itemId) ?? null
       const fameByEnchantment = {}
@@ -550,6 +599,7 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
         displayName: nameMap.get(itemId) ?? itemId,
         tier: Number.isFinite(tier) ? tier : null,
         craftingCategory,
+        artifactFilter,
         weight: parseNumber(rawItem['@weight'], 0),
         itemValue: itemValueByEnchantment[0] ?? parseNumber(rawItem['@itemvalue'], 0),
         itemValueByEnchantment,
