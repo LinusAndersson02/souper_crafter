@@ -15,7 +15,9 @@ interface SpotPriceEntry {
   location?: string
   quality?: number
   sell_price_min?: number
+  sell_price_min_date?: string
   buy_price_max?: number
+  buy_price_max_date?: string
 }
 
 interface HistoryPoint {
@@ -35,9 +37,13 @@ interface HistoryEntry {
 
 interface AggregatedSpotPoint {
   preferredSellOrder: number | null
+  preferredSellOrderUpdatedAt: string | null
   preferredBuyOrder: number | null
+  preferredBuyOrderUpdatedAt: string | null
   fallbackSellOrder: number | null
+  fallbackSellOrderUpdatedAt: string | null
   fallbackBuyOrder: number | null
+  fallbackBuyOrderUpdatedAt: string | null
 }
 
 interface HistoryAccumulator {
@@ -102,6 +108,8 @@ function createEmptyPricePoint(): CachedPricePoint {
     estimated: null,
     sellOrder: null,
     buyOrder: null,
+    sellOrderUpdatedAt: null,
+    buyOrderUpdatedAt: null,
     avgSoldPerDay30d: null,
     avgPrice30d: null,
     history30d: [],
@@ -213,6 +221,15 @@ function isPreferredQuality(quality: number | null): boolean {
   return quality === null || quality === 1
 }
 
+function toTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0) {
+    return null
+  }
+
+  const parsed = Date.parse(value)
+  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString()
+}
+
 async function fetchSpotPrices(
   itemIds: string[],
   locations: string[],
@@ -243,21 +260,45 @@ async function fetchSpotPrices(
       const key = buildKey(serverRegion, window, location, itemId)
       const aggregate = aggregates.get(key) ?? {
         preferredSellOrder: null,
+        preferredSellOrderUpdatedAt: null,
         preferredBuyOrder: null,
+        preferredBuyOrderUpdatedAt: null,
         fallbackSellOrder: null,
+        fallbackSellOrderUpdatedAt: null,
         fallbackBuyOrder: null,
+        fallbackBuyOrderUpdatedAt: null,
       }
 
       const sellOrder = toNumber(entry.sell_price_min)
+      const sellOrderUpdatedAt = toTimestamp(entry.sell_price_min_date)
       const buyOrder = toNumber(entry.buy_price_max)
+      const buyOrderUpdatedAt = toTimestamp(entry.buy_price_max_date)
       const quality = toNumber(entry.quality)
 
-      aggregate.fallbackSellOrder = minPositive(aggregate.fallbackSellOrder, sellOrder)
-      aggregate.fallbackBuyOrder = maxPositive(aggregate.fallbackBuyOrder, buyOrder)
+      const nextFallbackSellOrder = minPositive(aggregate.fallbackSellOrder, sellOrder)
+      if (nextFallbackSellOrder !== aggregate.fallbackSellOrder) {
+        aggregate.fallbackSellOrder = nextFallbackSellOrder
+        aggregate.fallbackSellOrderUpdatedAt = sellOrderUpdatedAt
+      }
+
+      const nextFallbackBuyOrder = maxPositive(aggregate.fallbackBuyOrder, buyOrder)
+      if (nextFallbackBuyOrder !== aggregate.fallbackBuyOrder) {
+        aggregate.fallbackBuyOrder = nextFallbackBuyOrder
+        aggregate.fallbackBuyOrderUpdatedAt = buyOrderUpdatedAt
+      }
 
       if (isPreferredQuality(quality)) {
-        aggregate.preferredSellOrder = minPositive(aggregate.preferredSellOrder, sellOrder)
-        aggregate.preferredBuyOrder = maxPositive(aggregate.preferredBuyOrder, buyOrder)
+        const nextPreferredSellOrder = minPositive(aggregate.preferredSellOrder, sellOrder)
+        if (nextPreferredSellOrder !== aggregate.preferredSellOrder) {
+          aggregate.preferredSellOrder = nextPreferredSellOrder
+          aggregate.preferredSellOrderUpdatedAt = sellOrderUpdatedAt
+        }
+
+        const nextPreferredBuyOrder = maxPositive(aggregate.preferredBuyOrder, buyOrder)
+        if (nextPreferredBuyOrder !== aggregate.preferredBuyOrder) {
+          aggregate.preferredBuyOrder = nextPreferredBuyOrder
+          aggregate.preferredBuyOrderUpdatedAt = buyOrderUpdatedAt
+        }
       }
 
       aggregates.set(key, aggregate)
@@ -269,11 +310,15 @@ async function fetchSpotPrices(
   for (const [key, aggregate] of aggregates.entries()) {
     const sellOrder = aggregate.preferredSellOrder ?? aggregate.fallbackSellOrder
     const buyOrder = aggregate.preferredBuyOrder ?? aggregate.fallbackBuyOrder
+    const sellOrderUpdatedAt = aggregate.preferredSellOrderUpdatedAt ?? aggregate.fallbackSellOrderUpdatedAt
+    const buyOrderUpdatedAt = aggregate.preferredBuyOrderUpdatedAt ?? aggregate.fallbackBuyOrderUpdatedAt
 
     values[key] = {
       estimated: resolveEstimatedSpotValue(sellOrder, buyOrder),
       sellOrder,
       buyOrder,
+      sellOrderUpdatedAt,
+      buyOrderUpdatedAt,
       avgSoldPerDay30d: null,
       avgPrice30d: null,
       history30d: [],
@@ -538,6 +583,8 @@ async function fetchHistoryAverages(
         estimated: preferredEstimated ?? fallbackEstimated,
         sellOrder: null,
         buyOrder: null,
+        sellOrderUpdatedAt: null,
+        buyOrderUpdatedAt: null,
         avgSoldPerDay30d: accumulator.hasSold30d ? accumulator.totalSold30d / THIRTY_DAY_WINDOW : null,
         avgPrice30d: preferredEstimated30d ?? fallbackEstimated30d,
         history30d: buildHistorySeries(accumulator.series30d),
@@ -605,6 +652,12 @@ export function getCachedPricePoint(
       : null,
     buyOrder: typeof value.buyOrder === 'number' && Number.isFinite(value.buyOrder) && value.buyOrder > 0
       ? value.buyOrder
+      : null,
+    sellOrderUpdatedAt: typeof value.sellOrderUpdatedAt === 'string' && !Number.isNaN(Date.parse(value.sellOrderUpdatedAt))
+      ? value.sellOrderUpdatedAt
+      : null,
+    buyOrderUpdatedAt: typeof value.buyOrderUpdatedAt === 'string' && !Number.isNaN(Date.parse(value.buyOrderUpdatedAt))
+      ? value.buyOrderUpdatedAt
       : null,
     avgSoldPerDay30d:
       typeof value.avgSoldPerDay30d === 'number' && Number.isFinite(value.avgSoldPerDay30d) && value.avgSoldPerDay30d >= 0

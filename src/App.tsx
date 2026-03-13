@@ -1,5 +1,6 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import './App.css'
+import { RefiningCalculatorTab } from './RefiningCalculatorTab'
 import {
   BUY_PRICE_TYPE_LABELS,
   MATERIAL_GROUP_LABELS,
@@ -36,8 +37,13 @@ import { useLocalStorageState } from './useLocalStorage'
 
 const SETTINGS_STORAGE_KEY = 'souper-crafter-settings-v6'
 const PLANS_STORAGE_KEY = 'souper-crafter-selected-plans-v3'
+const SAVED_CRAFTS_STORAGE_KEY = 'souper-crafter-saved-crafts-v1'
+const ACTIVE_TAB_STORAGE_KEY = 'souper-crafter-active-tab-v1'
+const SAVED_CRAFTS_SCHEMA_VERSION = 1
 const ESTIMATE_WINDOW = '7d' as const
 const DEFAULT_NEW_PLAN_QUANTITY = 10
+
+type AppTab = 'BLACK_MARKET' | 'REFINING'
 
 const ALL_ENCHANTMENTS = getAllEnchantments()
 const DAILY_BONUS_OPTIONS = buildDailyBonusOptionList()
@@ -62,6 +68,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   serverRegion: 'EU',
   hasPremium: true,
   targetCity: 'Black Market',
+  includeJournals: true,
+  craftingStationFeePer100Nutrition: 0,
   transportEmvPct: 10,
   transportSilverPerKg: 400,
   dailyBonusA: {
@@ -108,9 +116,75 @@ const HISTORY_FULL_DATE_FORMATTER = new Intl.DateTimeFormat('en-US', {
 })
 
 type UnknownRecord = Record<string, unknown>
+type SavedCraftRecord = {
+  id: string
+  name: string
+  savedAt: string
+  settings: AppSettings
+  plans: SelectedCraftPlan[]
+}
+
+type SavedCraftExportFile = {
+  schemaVersion: number
+  app: 'black-market-profit-calculator'
+  exportedAt: string
+  craft: SavedCraftRecord
+}
+
+type SaveFeedback = {
+  type: 'ok' | 'error'
+  message: string
+}
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function cloneValue<T>(value: T): T {
+  if (typeof structuredClone === 'function') {
+    return structuredClone(value)
+  }
+
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function createSavedCraftId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+
+  return `craft-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function buildDefaultSaveName(): string {
+  const now = new Date()
+  const datePart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const timePart = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`
+  return `Craft ${datePart} ${timePart}`
+}
+
+function sanitizeSaveName(name: string): string {
+  const trimmed = name.trim()
+  return trimmed.length > 0 ? trimmed : buildDefaultSaveName()
+}
+
+function buildSaveFileName(name: string): string {
+  const normalized = sanitizeSaveName(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return `${normalized || 'craft'}.json`
+}
+
+function downloadJsonFile(fileName: string, payload: unknown): void {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = fileName
+  anchor.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 function formatSilver(value: number | null): string {
@@ -153,6 +227,34 @@ function formatPerItem(value: number | null, quantity: number): string {
   return formatSilver(value / quantity)
 }
 
+function parseTierAndEnchantment(itemId: string): { tier: number | null; enchantment: number } {
+  const normalizedId = itemId.toUpperCase()
+  const tierMatch = normalizedId.match(/^T(\d+)/)
+  const enchantmentMatch = normalizedId.match(/@(\d+)$/) ?? normalizedId.match(/_LEVEL(\d+)(?:@\d+)?$/)
+
+  return {
+    tier: tierMatch ? Number(tierMatch[1]) : null,
+    enchantment: enchantmentMatch ? Number(enchantmentMatch[1]) : 0,
+  }
+}
+
+function formatNameWithTier(displayName: string, itemId: string): string {
+  const { tier, enchantment } = parseTierAndEnchantment(itemId)
+  if (tier === null) {
+    return displayName
+  }
+
+  return `${displayName} [T${tier}.${enchantment}]`
+}
+
+function formatBreakdownShare(value: number, total: number): string {
+  if (!Number.isFinite(total) || total === 0) {
+    return '--'
+  }
+
+  return formatPct((value / total) * 100)
+}
+
 function parseNumericInput(value: string, fallback: number): number {
   if (value.trim().length === 0) {
     return fallback
@@ -173,6 +275,129 @@ function compareVariants(a: CraftVariant, b: CraftVariant): number {
 
 function buildVariantLabel(variant: CraftVariant): string {
   return `${variant.displayName} [${variant.tierLabel}]`
+}
+
+function buildSummaryCardTitle(params: {
+  label: 'cost' | 'revenue' | 'profit'
+  results: PlannedCraftResult[]
+  includeJournals: boolean
+}): string {
+  const { label, results, includeJournals } = params
+
+  if (results.length === 0) {
+    return 'No planned crafts.'
+  }
+
+  if (label === 'cost') {
+    const totalMaterials = results.reduce((sum, result) => sum + (result.materialEffectiveCost ?? 0), 0)
+    const totalJournals = includeJournals
+      ? results.reduce((sum, result) => sum + (result.journalCost ?? 0), 0)
+      : 0
+    const totalCraftingFees = results.reduce((sum, result) => sum + (result.stationFee ?? 0), 0)
+    const totalTransport = results.reduce((sum, result) => sum + (result.transportFee ?? 0), 0)
+    const totalCost = results.reduce((sum, result) => sum + (result.totalCost ?? 0), 0)
+
+    const lines = [
+      'Cost Breakdown',
+      `Materials: ${formatSilver(totalMaterials)} (${formatBreakdownShare(totalMaterials, totalCost)})`,
+    ]
+
+    if (includeJournals) {
+      lines.push(`Journals: ${formatSilver(totalJournals)} (${formatBreakdownShare(totalJournals, totalCost)})`)
+    }
+
+    lines.push(`Crafting Fees: ${formatSilver(totalCraftingFees)} (${formatBreakdownShare(totalCraftingFees, totalCost)})`)
+    lines.push(`Transport: ${formatSilver(totalTransport)} (${formatBreakdownShare(totalTransport, totalCost)})`)
+    lines.push('', 'By Craft')
+
+    for (const result of [...results].sort((a, b) => (b.totalCost ?? 0) - (a.totalCost ?? 0))) {
+      const value = result.totalCost ?? 0
+      lines.push(`${buildVariantLabel(result.variant)}: ${formatSilver(value)} (${formatBreakdownShare(value, totalCost)})`)
+    }
+
+    return lines.join('\n')
+  }
+
+  if (label === 'revenue') {
+    const totalProducts = results.reduce((sum, result) => sum + (result.productRevenue ?? 0), 0)
+    const totalJournals = includeJournals
+      ? results.reduce((sum, result) => sum + (result.journalRevenue ?? 0), 0)
+      : 0
+    const totalRevenue = results.reduce((sum, result) => sum + (result.revenue ?? 0), 0)
+
+    const lines = [
+      'Revenue Breakdown',
+      `Products: ${formatSilver(totalProducts)} (${formatBreakdownShare(totalProducts, totalRevenue)})`,
+    ]
+
+    if (includeJournals) {
+      lines.push(`Journals: ${formatSilver(totalJournals)} (${formatBreakdownShare(totalJournals, totalRevenue)})`)
+    }
+
+    lines.push('', 'By Craft')
+
+    for (const result of [...results].sort((a, b) => (b.revenue ?? 0) - (a.revenue ?? 0))) {
+      const value = result.revenue ?? 0
+      lines.push(`${buildVariantLabel(result.variant)}: ${formatSilver(value)} (${formatBreakdownShare(value, totalRevenue)})`)
+    }
+
+    return lines.join('\n')
+  }
+
+  const totalProfit = results.reduce((sum, result) => sum + (result.netProfit ?? 0), 0)
+  const totalProducts = results.reduce((sum, result) => sum + (result.productRevenue ?? 0), 0)
+  const totalJournalRevenue = includeJournals
+    ? results.reduce((sum, result) => sum + (result.journalRevenue ?? 0), 0)
+    : 0
+  const totalJournalCost = includeJournals
+    ? results.reduce((sum, result) => sum + (result.journalCost ?? 0), 0)
+    : 0
+  const totalJournalNet = totalJournalRevenue - totalJournalCost
+  const totalMaterials = results.reduce((sum, result) => sum + (result.materialEffectiveCost ?? 0), 0)
+  const totalCraftingFees = results.reduce((sum, result) => sum + (result.stationFee ?? 0), 0)
+  const totalTransport = results.reduce((sum, result) => sum + (result.transportFee ?? 0), 0)
+  const totalMarketFees = results.reduce((sum, result) => sum + (result.marketFee ?? 0), 0)
+  const lines = [
+    'Profit Breakdown',
+    `Products: ${formatSilver(totalProducts)}`,
+  ]
+
+  if (includeJournals) {
+    lines.push(`Journals Net: ${formatSilver(totalJournalNet)} (${formatBreakdownShare(totalJournalNet, totalProfit)})`)
+  }
+
+  lines.push(`Market Fees: -${formatSilver(totalMarketFees)} (${formatBreakdownShare(-totalMarketFees, totalProfit)})`)
+  lines.push(`Materials: -${formatSilver(totalMaterials)} (${formatBreakdownShare(-totalMaterials, totalProfit)})`)
+  lines.push(`Crafting Fees: -${formatSilver(totalCraftingFees)} (${formatBreakdownShare(-totalCraftingFees, totalProfit)})`)
+  lines.push(`Transport: -${formatSilver(totalTransport)} (${formatBreakdownShare(-totalTransport, totalProfit)})`)
+  lines.push('', 'By Craft')
+
+  for (const result of [...results].sort((a, b) => (b.netProfit ?? 0) - (a.netProfit ?? 0))) {
+    const value = result.netProfit ?? 0
+    lines.push(`${buildVariantLabel(result.variant)}: ${formatSilver(value)} (${formatBreakdownShare(value, totalProfit)})`)
+  }
+
+  return lines.join('\n')
+}
+
+function compareMaterialLines(a: PlannedCraftResult['materialLines'][number], b: PlannedCraftResult['materialLines'][number]): number {
+  const cityComparison = a.buyCity.localeCompare(b.buyCity)
+  if (cityComparison !== 0) {
+    return cityComparison
+  }
+
+  const aTier = parseTierAndEnchantment(a.marketItemId)
+  const bTier = parseTierAndEnchantment(b.marketItemId)
+
+  if ((aTier.tier ?? 0) !== (bTier.tier ?? 0)) {
+    return (aTier.tier ?? 0) - (bTier.tier ?? 0)
+  }
+
+  if (aTier.enchantment !== bTier.enchantment) {
+    return aTier.enchantment - bTier.enchantment
+  }
+
+  return a.displayName.localeCompare(b.displayName)
 }
 
 function normalizeSearchCategory(item: CraftItem): string | null {
@@ -291,10 +516,11 @@ function buildCollapsedInfoTitle(result: PlannedCraftResult): string {
   return [
     `Return Rate: ${formatPct(result.returnRate * 100)}`,
     `Output Weight: ${formatWeight(result.baseItem.weight * result.plan.quantity)}`,
+    `Crafting Fee: ${formatSilver(result.stationFee)}`,
     `Market Fee: ${formatSilver(result.marketFee)}`,
     `Transport Fee: ${formatSilver(result.transportFee)}`,
     `Nutrition: ${result.stationNutrition !== null ? DECIMAL_FORMATTER.format(result.stationNutrition) : '--'}`,
-    `Estimated Item Value: ${formatSilver(result.itemValuePerCraft)}`,
+    `Item Value: ${formatSilver(result.itemValuePerCraft)}`,
   ].join('\n')
 }
 
@@ -529,7 +755,20 @@ function MarketHistoryCard(props: {
   )
 }
 
-function resolveRowStatus(result: { missingPrices: string[]; avgSoldPerDay30d: number | null; avgPrice30d: number | null }) {
+function formatAgeHours(hours: number): string {
+  if (hours >= 48) {
+    return `${(hours / 24).toFixed(1)}d`
+  }
+
+  return `${hours.toFixed(1)}h`
+}
+
+function resolveRowStatus(result: {
+  missingPrices: string[]
+  priceAgeHours: number | null
+  avgSoldPerDay30d: number | null
+  avgPrice30d: number | null
+}) {
   const historyText =
     result.avgSoldPerDay30d !== null
       ? '30 day volume history is available.'
@@ -545,11 +784,35 @@ function resolveRowStatus(result: { missingPrices: string[]; avgSoldPerDay30d: n
     }
   }
 
-  if (result.avgSoldPerDay30d !== null) {
+  if (result.priceAgeHours !== null) {
+    if (result.priceAgeHours >= 24) {
+      return {
+        symbol: '●',
+        className: 'row-status-icon stale-critical',
+        title: `At least one live price used by this craft is ${formatAgeHours(result.priceAgeHours)} old. ${historyText}`,
+      }
+    }
+
+    if (result.priceAgeHours >= 4) {
+      return {
+        symbol: '●',
+        className: 'row-status-icon stale-warning',
+        title: `At least one live price used by this craft is ${formatAgeHours(result.priceAgeHours)} old. ${historyText}`,
+      }
+    }
+
     return {
       symbol: '●',
       className: 'row-status-icon ready',
-      title: `All required prices are present. ${historyText}`,
+      title: `All live prices used by this craft are fresher than 4 hours. ${historyText}`,
+    }
+  }
+
+  if (result.avgSoldPerDay30d !== null) {
+    return {
+      symbol: '◐',
+      className: 'row-status-icon partial',
+      title: `All required prices are present, but no live order timestamps are available for this craft. ${historyText}`,
     }
   }
 
@@ -623,6 +886,13 @@ function normalizeSettings(rawSettings: AppSettings, gameData: GameData | null):
       : 'EU'
 
   const targetCity = validSellTargets.has(rawSettings.targetCity) ? rawSettings.targetCity : 'Black Market'
+  const includeJournals =
+    typeof rawSettings.includeJournals === 'boolean' ? rawSettings.includeJournals : DEFAULT_SETTINGS.includeJournals
+  const craftingStationFeePer100Nutrition =
+    typeof rawSettings.craftingStationFeePer100Nutrition === 'number' &&
+    Number.isFinite(rawSettings.craftingStationFeePer100Nutrition)
+      ? Math.max(0, rawSettings.craftingStationFeePer100Nutrition)
+      : DEFAULT_SETTINGS.craftingStationFeePer100Nutrition
   const validDailyBonusValues = new Set(DAILY_BONUS_OPTIONS.map((option) => option.value))
   const transportEmvPct =
     typeof rawSettings.transportEmvPct === 'number' && Number.isFinite(rawSettings.transportEmvPct)
@@ -652,6 +922,8 @@ function normalizeSettings(rawSettings: AppSettings, gameData: GameData | null):
     serverRegion,
     hasPremium: typeof rawSettings.hasPremium === 'boolean' ? rawSettings.hasPremium : true,
     targetCity,
+    includeJournals,
+    craftingStationFeePer100Nutrition,
     transportEmvPct,
     transportSilverPerKg,
     dailyBonusA: {
@@ -662,6 +934,87 @@ function normalizeSettings(rawSettings: AppSettings, gameData: GameData | null):
       category: dailyBonusB?.category ?? '',
       percent: dailyBonusB?.percent === 20 ? 20 : 10,
     },
+  }
+}
+
+function normalizeImportedSettings(rawSettings: unknown, gameData: GameData | null): AppSettings {
+  if (!isRecord(rawSettings)) {
+    return normalizeSettings(DEFAULT_SETTINGS, gameData)
+  }
+
+  const merged: AppSettings = {
+    ...DEFAULT_SETTINGS,
+    ...(rawSettings as Partial<AppSettings>),
+    dailyBonusA: isRecord(rawSettings.dailyBonusA)
+      ? {
+          ...DEFAULT_SETTINGS.dailyBonusA,
+          ...(rawSettings.dailyBonusA as Partial<AppSettings['dailyBonusA']>),
+        }
+      : DEFAULT_SETTINGS.dailyBonusA,
+    dailyBonusB: isRecord(rawSettings.dailyBonusB)
+      ? {
+          ...DEFAULT_SETTINGS.dailyBonusB,
+          ...(rawSettings.dailyBonusB as Partial<AppSettings['dailyBonusB']>),
+        }
+      : DEFAULT_SETTINGS.dailyBonusB,
+  }
+
+  return normalizeSettings(merged, gameData)
+}
+
+function createSavedCraftRecord(params: {
+  id?: string
+  name: string
+  savedAt?: string
+  settings: AppSettings
+  plans: SelectedCraftPlan[]
+}): SavedCraftRecord {
+  const { id, name, savedAt, settings, plans } = params
+
+  return {
+    id: id ?? createSavedCraftId(),
+    name: sanitizeSaveName(name),
+    savedAt: savedAt ?? new Date().toISOString(),
+    settings: cloneValue(settings),
+    plans: cloneValue(plans),
+  }
+}
+
+function normalizeSavedCraftRecord(rawValue: unknown, gameData: GameData): SavedCraftRecord | null {
+  if (!isRecord(rawValue)) {
+    return null
+  }
+
+  const settings = normalizeImportedSettings(rawValue.settings, gameData)
+  const rawPlans = Array.isArray(rawValue.plans) ? rawValue.plans : []
+  const plans = rawPlans
+    .map((rawPlan) => normalizeSelectedPlan(rawPlan, gameData, settings.targetCity))
+    .filter((plan): plan is SelectedCraftPlan => plan !== null)
+
+  return createSavedCraftRecord({
+    id: typeof rawValue.id === 'string' && rawValue.id.trim().length > 0 ? rawValue.id : undefined,
+    name: typeof rawValue.name === 'string' ? rawValue.name : '',
+    savedAt:
+      typeof rawValue.savedAt === 'string' && rawValue.savedAt.trim().length > 0 ? rawValue.savedAt : undefined,
+    settings,
+    plans,
+  })
+}
+
+function normalizeImportedCraftFile(rawValue: unknown, gameData: GameData): SavedCraftRecord | null {
+  if (isRecord(rawValue) && isRecord(rawValue.craft)) {
+    return normalizeSavedCraftRecord(rawValue.craft, gameData)
+  }
+
+  return normalizeSavedCraftRecord(rawValue, gameData)
+}
+
+function buildSavedCraftExportFile(craft: SavedCraftRecord): SavedCraftExportFile {
+  return {
+    schemaVersion: SAVED_CRAFTS_SCHEMA_VERSION,
+    app: 'black-market-profit-calculator',
+    exportedAt: new Date().toISOString(),
+    craft,
   }
 }
 
@@ -792,8 +1145,10 @@ function normalizeSelectedPlan(rawPlan: unknown, gameData: GameData, targetCity:
 }
 
 function App() {
+  const [activeTab, setActiveTab] = useLocalStorageState<AppTab>(ACTIVE_TAB_STORAGE_KEY, 'BLACK_MARKET')
   const [settings, setSettings] = useLocalStorageState<AppSettings>(SETTINGS_STORAGE_KEY, DEFAULT_SETTINGS)
   const [selectedPlans, setSelectedPlans] = useLocalStorageState<SelectedCraftPlan[]>(PLANS_STORAGE_KEY, [])
+  const [storedSavedCrafts, setStoredSavedCrafts] = useLocalStorageState<SavedCraftRecord[]>(SAVED_CRAFTS_STORAGE_KEY, [])
 
   const [gameData, setGameData] = useState<GameData | null>(null)
   const [dataError, setDataError] = useState<string | null>(null)
@@ -803,12 +1158,23 @@ function App() {
   const [priceWarning, setPriceWarning] = useState<string | null>(null)
   const [priceLoading, setPriceLoading] = useState(false)
   const [expandedRows, setExpandedRows] = useState<string[]>([])
+  const [activeSavedCraftId, setActiveSavedCraftId] = useState<string | null>(null)
+  const [saveName, setSaveName] = useState(() => buildDefaultSaveName())
+  const [saveFeedback, setSaveFeedback] = useState<SaveFeedback | null>(null)
 
   const requestAbortRef = useRef<AbortController | null>(null)
+  const importInputRef = useRef<HTMLInputElement | null>(null)
+  const safeActiveTab: AppTab = activeTab === 'REFINING' ? 'REFINING' : 'BLACK_MARKET'
 
   useEffect(() => {
-    document.title = 'Black Market Profit Calculator'
-  }, [])
+    if (activeTab !== safeActiveTab) {
+      setActiveTab(safeActiveTab)
+    }
+  }, [activeTab, safeActiveTab, setActiveTab])
+
+  useEffect(() => {
+    document.title = safeActiveTab === 'REFINING' ? 'Refining Profit Calculator' : 'Black Market Profit Calculator'
+  }, [safeActiveTab])
 
   useEffect(() => {
     let isMounted = true
@@ -847,6 +1213,10 @@ function App() {
   }, [])
 
   const safeSettings = useMemo(() => normalizeSettings(settings, gameData), [settings, gameData])
+  const savedCrafts = useMemo(
+    () => (gameData ? storedSavedCrafts.map((entry) => normalizeSavedCraftRecord(entry, gameData)).filter((entry): entry is SavedCraftRecord => entry !== null) : []),
+    [gameData, storedSavedCrafts],
+  )
 
   useEffect(() => {
     const normalized = normalizeSettings(settings, gameData)
@@ -854,6 +1224,30 @@ function App() {
       setSettings(normalized)
     }
   }, [gameData, setSettings, settings])
+
+  useEffect(() => {
+    if (!gameData) {
+      return
+    }
+
+    if (JSON.stringify(savedCrafts) !== JSON.stringify(storedSavedCrafts)) {
+      setStoredSavedCrafts(savedCrafts)
+    }
+  }, [gameData, savedCrafts, setStoredSavedCrafts, storedSavedCrafts])
+
+  useEffect(() => {
+    if (savedCrafts.length === 0) {
+      if (activeSavedCraftId !== null) {
+        setActiveSavedCraftId(null)
+      }
+
+      return
+    }
+
+    if (activeSavedCraftId && !savedCrafts.some((entry) => entry.id === activeSavedCraftId)) {
+      setActiveSavedCraftId(null)
+    }
+  }, [activeSavedCraftId, savedCrafts])
 
   const knownMarketItemIdSet = useMemo(() => new Set(gameData?.knownMarketItemIds ?? []), [gameData])
 
@@ -1015,8 +1409,14 @@ function App() {
   )
 
   const requiredItemIds = useMemo(
-    () => collectRequiredPriceItemIds({ plans: selectedPlans, itemsById, knownMarketItemIds: knownMarketItemIdSet }),
-    [selectedPlans, itemsById, knownMarketItemIdSet],
+    () =>
+      collectRequiredPriceItemIds({
+        plans: selectedPlans,
+        itemsById,
+        knownMarketItemIds: knownMarketItemIdSet,
+        includeJournals: safeSettings.includeJournals,
+      }),
+    [selectedPlans, itemsById, knownMarketItemIdSet, safeSettings.includeJournals],
   )
 
   const requiredFingerprint = useMemo(() => requiredItemIds.join('|'), [requiredItemIds])
@@ -1132,6 +1532,8 @@ function App() {
         quantity: number
         unitPrice: number
         totalCost: number
+        sortTier: number
+        sortEnchantment: number
       }
     >()
     const journals = new Map<
@@ -1148,6 +1550,11 @@ function App() {
     let totalOutputQuantity = 0
     let totalOutputRevenue = 0
     let totalOutputWeight = 0
+    let totalInputQuantity = 0
+    let totalInputCost = 0
+    let totalJournalAmount = 0
+    let totalJournalBuyCost = 0
+    let totalJournalSellRevenue = 0
 
     for (const result of plannedView.results) {
       const outputKey = `${result.variant.marketItemId}|${result.sellCity}`
@@ -1169,18 +1576,23 @@ function App() {
 
       for (const line of result.materialLines) {
         const inputKey = `${line.marketItemId}|${line.buyCity}`
+        const parsedTier = parseTierAndEnchantment(line.marketItemId)
         const existingInput = inputs.get(inputKey) ?? {
-          displayName: line.displayName,
+          displayName: formatNameWithTier(line.displayName, line.marketItemId),
           marketItemId: line.marketItemId,
           buyCity: line.buyCity,
           quantity: 0,
           unitPrice: line.unitPrice ?? 0,
           totalCost: 0,
+          sortTier: parsedTier.tier ?? 0,
+          sortEnchantment: parsedTier.enchantment,
         }
 
         existingInput.quantity += line.quantity
         existingInput.totalCost += line.totalCost ?? 0
         inputs.set(inputKey, existingInput)
+        totalInputQuantity += line.quantity
+        totalInputCost += line.totalCost ?? 0
       }
 
       if (result.journalLine) {
@@ -1198,20 +1610,68 @@ function App() {
         existingJournal.buyCost += result.journalLine.buyTotalCost ?? 0
         existingJournal.sellRevenue += result.journalLine.sellTotalRevenue ?? 0
         journals.set(journalKey, existingJournal)
+        totalJournalAmount += result.journalLine.amount
+        totalJournalBuyCost += result.journalLine.buyTotalCost ?? 0
+        totalJournalSellRevenue += result.journalLine.sellTotalRevenue ?? 0
       }
     }
 
     return {
       outputs: [...outputs.values()].sort((a, b) => a.label.localeCompare(b.label)),
-      inputs: [...inputs.values()].sort((a, b) => a.displayName.localeCompare(b.displayName)),
+      inputs: [...inputs.values()].sort((a, b) => {
+        const cityComparison = a.buyCity.localeCompare(b.buyCity)
+        if (cityComparison !== 0) {
+          return cityComparison
+        }
+
+        if (a.sortTier !== b.sortTier) {
+          return a.sortTier - b.sortTier
+        }
+
+        if (a.sortEnchantment !== b.sortEnchantment) {
+          return a.sortEnchantment - b.sortEnchantment
+        }
+
+        return a.displayName.localeCompare(b.displayName)
+      }),
       journals: [...journals.values()].sort((a, b) => a.label.localeCompare(b.label)),
       outputTotals: {
         quantity: totalOutputQuantity,
         revenue: totalOutputRevenue,
         weight: totalOutputWeight,
       },
+      inputTotals: {
+        quantity: totalInputQuantity,
+        totalCost: totalInputCost,
+      },
+      journalTotals: {
+        amount: totalJournalAmount,
+        buyCost: totalJournalBuyCost,
+        sellRevenue: totalJournalSellRevenue,
+      },
     }
   }, [plannedView.results])
+
+  const summaryCardTitles = useMemo(
+    () => ({
+      cost: buildSummaryCardTitle({
+        label: 'cost',
+        results: plannedView.results,
+        includeJournals: safeSettings.includeJournals,
+      }),
+      revenue: buildSummaryCardTitle({
+        label: 'revenue',
+        results: plannedView.results,
+        includeJournals: safeSettings.includeJournals,
+      }),
+      profit: buildSummaryCardTitle({
+        label: 'profit',
+        results: plannedView.results,
+        includeJournals: safeSettings.includeJournals,
+      }),
+    }),
+    [plannedView.results, safeSettings.includeJournals],
+  )
 
   const bulkBuyPriceType = useMemo(() => {
     if (selectedPlans.length === 0) {
@@ -1311,6 +1771,156 @@ function App() {
     }))
   }
 
+  const loadSavedCraft = useCallback(
+    (savedCraft: SavedCraftRecord) => {
+      setSettings(savedCraft.settings)
+      setSelectedPlans(savedCraft.plans)
+      setExpandedRows([])
+      setActiveSavedCraftId(savedCraft.id)
+      setSaveName(savedCraft.name)
+      setSaveFeedback({
+        type: 'ok',
+        message: `Loaded "${savedCraft.name}".`,
+      })
+    },
+    [setSelectedPlans, setSettings],
+  )
+
+  const saveCurrentCraftAsNew = useCallback(() => {
+    const nextCraft = createSavedCraftRecord({
+      name: saveName,
+      settings: safeSettings,
+      plans: selectedPlans,
+    })
+
+    setStoredSavedCrafts((previous) => [nextCraft, ...previous])
+    setActiveSavedCraftId(nextCraft.id)
+    setSaveName(nextCraft.name)
+    setSaveFeedback({
+      type: 'ok',
+      message: `Saved "${nextCraft.name}".`,
+    })
+  }, [safeSettings, saveName, selectedPlans, setStoredSavedCrafts])
+
+  const updateSavedCraft = useCallback(() => {
+    if (!activeSavedCraftId) {
+      return
+    }
+
+    const nextName = sanitizeSaveName(saveName)
+    let updated = false
+
+    setStoredSavedCrafts((previous) =>
+      previous.map((entry) => {
+        if (entry.id !== activeSavedCraftId) {
+          return entry
+        }
+
+        updated = true
+        return createSavedCraftRecord({
+          id: entry.id,
+          name: nextName,
+          savedAt: new Date().toISOString(),
+          settings: safeSettings,
+          plans: selectedPlans,
+        })
+      }),
+    )
+
+    if (updated) {
+      setSaveName(nextName)
+      setSaveFeedback({
+        type: 'ok',
+        message: `Updated "${nextName}".`,
+      })
+    }
+  }, [activeSavedCraftId, safeSettings, saveName, selectedPlans, setStoredSavedCrafts])
+
+  const deleteSavedCraft = useCallback(
+    (craftId: string) => {
+      const deletedCraft = savedCrafts.find((entry) => entry.id === craftId)
+      setStoredSavedCrafts((previous) => previous.filter((entry) => entry.id !== craftId))
+
+      if (activeSavedCraftId === craftId) {
+        setActiveSavedCraftId(null)
+        setSaveName(buildDefaultSaveName())
+      }
+
+      setSaveFeedback({
+        type: 'ok',
+        message: deletedCraft ? `Deleted "${deletedCraft.name}".` : 'Deleted saved craft.',
+      })
+    },
+    [activeSavedCraftId, savedCrafts, setStoredSavedCrafts],
+  )
+
+  const exportCurrentCraft = useCallback(() => {
+    const currentCraft = createSavedCraftRecord({
+      name: saveName,
+      settings: safeSettings,
+      plans: selectedPlans,
+    })
+
+    downloadJsonFile(buildSaveFileName(currentCraft.name), buildSavedCraftExportFile(currentCraft))
+    setSaveFeedback({
+      type: 'ok',
+      message: `Exported "${currentCraft.name}".`,
+    })
+  }, [safeSettings, saveName, selectedPlans])
+
+  const exportSavedCraft = useCallback((savedCraft: SavedCraftRecord) => {
+    downloadJsonFile(buildSaveFileName(savedCraft.name), buildSavedCraftExportFile(savedCraft))
+    setSaveFeedback({
+      type: 'ok',
+      message: `Exported "${savedCraft.name}".`,
+    })
+  }, [])
+
+  const triggerImport = useCallback(() => {
+    importInputRef.current?.click()
+  }, [])
+
+  const handleImportFile = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0]
+      event.target.value = ''
+
+      if (!file || !gameData) {
+        return
+      }
+
+      try {
+        const text = await file.text()
+        const parsed = JSON.parse(text) as unknown
+        const importedCraft = normalizeImportedCraftFile(parsed, gameData)
+
+        if (!importedCraft) {
+          throw new Error('Invalid craft file.')
+        }
+
+        const finalCraft = createSavedCraftRecord({
+          ...importedCraft,
+          id: createSavedCraftId(),
+          name: importedCraft.name,
+          savedAt: new Date().toISOString(),
+        })
+
+        setStoredSavedCrafts((previous) => [finalCraft, ...previous])
+        loadSavedCraft(finalCraft)
+        setSaveFeedback({
+          type: 'ok',
+          message: `Imported "${finalCraft.name}".`,
+        })
+      } catch (error) {
+        setSaveFeedback({
+          type: 'error',
+          message: error instanceof Error ? error.message : 'Failed to import craft file.',
+        })
+      }
+    },
+    [gameData, loadSavedCraft, setStoredSavedCrafts],
+  )
+
   const applyBuyPriceTypeToAll = (buyPriceType: BuyPriceType) => {
     setSelectedPlans((previous) => previous.map((plan) => ({ ...plan, buyPriceType })))
   }
@@ -1345,16 +1955,42 @@ function App() {
       <header className="top-header">
         <div>
           <p className="eyebrow">Albion Online</p>
-          <h1>Black Market Profit Calculator</h1>
+          <h1>{safeActiveTab === 'REFINING' ? 'Refining Profit Calculator' : 'Black Market Profit Calculator'}</h1>
           <p className="subtitle">
-            Minimal global settings, per-craft routing, and Black Market focused crafting plans.
+            {safeActiveTab === 'REFINING'
+              ? 'Recursive refining plans for planks, cloth, leather, and bars without touching the Black Market flow.'
+              : 'Minimal global settings, per-craft routing, and Black Market focused crafting plans.'}
           </p>
+          <div className="app-tab-bar" role="tablist" aria-label="Calculator tabs">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={safeActiveTab === 'BLACK_MARKET'}
+              className={safeActiveTab === 'BLACK_MARKET' ? 'app-tab active' : 'app-tab'}
+              onClick={() => setActiveTab('BLACK_MARKET')}
+            >
+              Black Market
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={safeActiveTab === 'REFINING'}
+              className={safeActiveTab === 'REFINING' ? 'app-tab active' : 'app-tab'}
+              onClick={() => setActiveTab('REFINING')}
+            >
+              Refining
+            </button>
+          </div>
         </div>
-        <button type="button" className="refresh-btn" onClick={() => void refreshPrices()} disabled={priceLoading}>
-          {priceLoading ? 'Refreshing prices...' : 'Refresh Prices'}
-        </button>
+        {safeActiveTab === 'BLACK_MARKET' && (
+          <button type="button" className="refresh-btn" onClick={() => void refreshPrices()} disabled={priceLoading}>
+            {priceLoading ? 'Refreshing prices...' : 'Refresh Prices'}
+          </button>
+        )}
       </header>
 
+      {safeActiveTab === 'BLACK_MARKET' ? (
+        <>
       <section className="panel picker-panel">
         <div className="panel-title-row">
           <div>
@@ -1498,196 +2134,315 @@ function App() {
         </div>
       </section>
 
-      <section className="panel settings-panel global-bar-panel">
-        <div className="panel-title-row">
-          <h2>Global Settings</h2>
-          <p>
-            {priceBook.fetchedAt
-              ? `Last update: ${new Date(priceBook.fetchedAt).toLocaleString()} · ${ESTIMATE_WINDOW} estimates`
-              : `No price snapshot yet · ${ESTIMATE_WINDOW} estimates`}
-          </p>
-        </div>
+      <div className="top-control-grid">
+        <section className="panel settings-panel global-bar-panel">
+          <div className="panel-title-row">
+            <h2>Global Settings</h2>
+            <p>
+              {priceBook.fetchedAt
+                ? `Last update: ${new Date(priceBook.fetchedAt).toLocaleString()} · ${ESTIMATE_WINDOW} estimates`
+                : `No price snapshot yet · ${ESTIMATE_WINDOW} estimates`}
+            </p>
+          </div>
 
-        <div className="settings-sections">
-          <div className="settings-card">
-            <div className="settings-card-header">
-              <h3>Core</h3>
-              <p>Region, premium status, and default sell target.</p>
+          <div className="settings-sections">
+            <div className="settings-card">
+              <div className="settings-card-header">
+                <h3>Core</h3>
+                <p>Region, premium status, default sell target, journals, and station fee.</p>
+              </div>
+              <div className="global-bar-grid">
+                <label>
+                  Server Region
+                  <select
+                    value={safeSettings.serverRegion}
+                    onChange={(event) => updateSettings('serverRegion', event.target.value as ServerRegion)}
+                  >
+                    <option value="EU">Europe</option>
+                    <option value="US">Americas</option>
+                    <option value="ASIA">Asia</option>
+                  </select>
+                </label>
+
+                <label>
+                  Premium Status
+                  <select
+                    value={safeSettings.hasPremium ? 'premium' : 'standard'}
+                    onChange={(event) => updateSettings('hasPremium', event.target.value === 'premium')}
+                  >
+                    <option value="premium">Premium</option>
+                    <option value="standard">No Premium</option>
+                  </select>
+                </label>
+
+                <label>
+                  Target City
+                  <select
+                    value={safeSettings.targetCity}
+                    onChange={(event) => updateSettings('targetCity', event.target.value as SellTarget)}
+                  >
+                    {sellTargetOptions.map((target) => (
+                      <option key={target} value={target}>
+                        {target}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  Station Fee / 100 Nutrition
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={safeSettings.craftingStationFeePer100Nutrition}
+                    onChange={(event) =>
+                      updateSettings(
+                        'craftingStationFeePer100Nutrition',
+                        Math.max(0, parseNumericInput(event.target.value, safeSettings.craftingStationFeePer100Nutrition)),
+                      )
+                    }
+                  />
+                </label>
+
+                <div className="field-card">
+                  <span>Journals</span>
+                  <div className="toggle-row field-toggle-row">
+                    <button
+                      type="button"
+                      className={safeSettings.includeJournals ? 'toggle-chip active' : 'toggle-chip'}
+                      onClick={() => updateSettings('includeJournals', true)}
+                    >
+                      On
+                    </button>
+                    <button
+                      type="button"
+                      className={!safeSettings.includeJournals ? 'toggle-chip active' : 'toggle-chip'}
+                      onClick={() => updateSettings('includeJournals', false)}
+                    >
+                      Off
+                    </button>
+                  </div>
+                  <small>Add empty journal cost and full journal revenue to craft profit.</small>
+                </div>
+              </div>
             </div>
-            <div className="global-bar-grid">
-              <label>
-                Server Region
-                <select
-                  value={safeSettings.serverRegion}
-                  onChange={(event) => updateSettings('serverRegion', event.target.value as ServerRegion)}
-                >
-                  <option value="EU">Europe</option>
-                  <option value="US">Americas</option>
-                  <option value="ASIA">Asia</option>
-                </select>
-              </label>
 
-              <label>
-                Premium Status
-                <select
-                  value={safeSettings.hasPremium ? 'premium' : 'standard'}
-                  onChange={(event) => updateSettings('hasPremium', event.target.value === 'premium')}
-                >
-                  <option value="premium">Premium</option>
-                  <option value="standard">No Premium</option>
-                </select>
-              </label>
+            <div className="settings-card">
+              <div className="settings-card-header">
+                <h3>Transport Costs</h3>
+                <p>Black Market transport uses the higher of EMV % or silver per kg.</p>
+              </div>
+              <div className="transport-grid">
+                <label>
+                  Transport EMV %
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    value={safeSettings.transportEmvPct}
+                    onChange={(event) =>
+                      updateSettings(
+                        'transportEmvPct',
+                        Math.max(0, parseNumericInput(event.target.value, safeSettings.transportEmvPct)),
+                      )
+                    }
+                  />
+                </label>
 
-              <label>
-                Target City
-                <select
-                  value={safeSettings.targetCity}
-                  onChange={(event) => updateSettings('targetCity', event.target.value as SellTarget)}
-                >
-                  {sellTargetOptions.map((target) => (
-                    <option key={target} value={target}>
-                      {target}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                <label>
+                  Transport Silver / Kg
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={safeSettings.transportSilverPerKg}
+                    onChange={(event) =>
+                      updateSettings(
+                        'transportSilverPerKg',
+                        Math.max(0, parseNumericInput(event.target.value, safeSettings.transportSilverPerKg)),
+                      )
+                    }
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="settings-card settings-card-wide">
+              <div className="settings-card-header">
+                <h3>Daily Bonuses</h3>
+                <p>Two optional production bonuses applied to matching craft categories.</p>
+              </div>
+              <div className="daily-bonus-grid">
+                <label>
+                  Daily Bonus A
+                  <select
+                    value={safeSettings.dailyBonusA.category}
+                    onChange={(event) =>
+                      updateSettings('dailyBonusA', {
+                        ...safeSettings.dailyBonusA,
+                        category: event.target.value,
+                      })
+                    }
+                  >
+                    {DAILY_BONUS_OPTIONS.map((option) => (
+                      <option key={`bonus-a-${option.value || 'none'}`} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  Bonus A %
+                  <select
+                    value={safeSettings.dailyBonusA.percent}
+                    onChange={(event) =>
+                      updateSettings('dailyBonusA', {
+                        ...safeSettings.dailyBonusA,
+                        percent: Number(event.target.value) as 10 | 20,
+                      })
+                    }
+                  >
+                    <option value={10}>10%</option>
+                    <option value={20}>20%</option>
+                  </select>
+                </label>
+
+                <label>
+                  Daily Bonus B
+                  <select
+                    value={safeSettings.dailyBonusB.category}
+                    onChange={(event) =>
+                      updateSettings('dailyBonusB', {
+                        ...safeSettings.dailyBonusB,
+                        category: event.target.value,
+                      })
+                    }
+                  >
+                    {DAILY_BONUS_OPTIONS.map((option) => (
+                      <option key={`bonus-b-${option.value || 'none'}`} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label>
+                  Bonus B %
+                  <select
+                    value={safeSettings.dailyBonusB.percent}
+                    onChange={(event) =>
+                      updateSettings('dailyBonusB', {
+                        ...safeSettings.dailyBonusB,
+                        percent: Number(event.target.value) as 10 | 20,
+                      })
+                    }
+                  >
+                    <option value={10}>10%</option>
+                    <option value={20}>20%</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside className="panel saved-crafts-panel">
+          <div className="panel-title-row">
+            <div>
+              <h2>Saved Crafts</h2>
+              <p>{savedCrafts.length} saved sets in local storage.</p>
             </div>
           </div>
 
-          <div className="settings-card">
-            <div className="settings-card-header">
-              <h3>Transport Costs</h3>
-              <p>Black Market transport uses the higher of EMV % or silver per kg.</p>
-            </div>
-            <div className="transport-grid">
-              <label>
-                Transport EMV %
-                <input
-                  type="number"
-                  min={0}
-                  step={0.1}
-                  value={safeSettings.transportEmvPct}
-                  onChange={(event) =>
-                    updateSettings(
-                      'transportEmvPct',
-                      Math.max(0, parseNumericInput(event.target.value, safeSettings.transportEmvPct)),
-                    )
-                  }
-                />
-              </label>
+          <div className="saved-crafts-content">
+            <label>
+              Craft Name
+              <input
+                type="text"
+                value={saveName}
+                onChange={(event) => setSaveName(event.target.value)}
+                placeholder="Craft name"
+              />
+            </label>
 
-              <label>
-                Transport Silver / Kg
-                <input
-                  type="number"
-                  min={0}
-                  step={1}
-                  value={safeSettings.transportSilverPerKg}
-                  onChange={(event) =>
-                    updateSettings(
-                      'transportSilverPerKg',
-                      Math.max(0, parseNumericInput(event.target.value, safeSettings.transportSilverPerKg)),
-                    )
-                  }
-                />
-              </label>
+            <div className="saved-craft-actions">
+              <button type="button" className="link-btn" onClick={saveCurrentCraftAsNew} disabled={selectedPlans.length === 0}>
+                Save New
+              </button>
+              <button
+                type="button"
+                className="link-btn"
+                onClick={updateSavedCraft}
+                disabled={selectedPlans.length === 0 || activeSavedCraftId === null}
+              >
+                Update
+              </button>
+              <button type="button" className="link-btn" onClick={exportCurrentCraft} disabled={selectedPlans.length === 0}>
+                Export Current
+              </button>
+              <button type="button" className="link-btn" onClick={triggerImport}>
+                Import JSON
+              </button>
             </div>
+
+            <input ref={importInputRef} type="file" accept="application/json,.json" className="hidden-input" onChange={handleImportFile} />
+
+            {saveFeedback && <p className={`banner ${saveFeedback.type === 'error' ? 'error' : 'info'}`}>{saveFeedback.message}</p>}
+
+            {savedCrafts.length === 0 ? (
+              <p className="muted">No saved craft sets yet.</p>
+            ) : (
+              <div className="saved-craft-list">
+                {savedCrafts.map((savedCraft) => (
+                  <article
+                    key={savedCraft.id}
+                    className={`saved-craft-item ${savedCraft.id === activeSavedCraftId ? 'active' : ''}`}
+                  >
+                    <div className="saved-craft-meta">
+                      <strong>{savedCraft.name}</strong>
+                      <span>
+                        {savedCraft.plans.length} crafts · {new Date(savedCraft.savedAt).toLocaleString()}
+                      </span>
+                    </div>
+
+                    <div className="saved-craft-item-actions">
+                      <button type="button" className="link-btn" onClick={() => loadSavedCraft(savedCraft)}>
+                        Load
+                      </button>
+                      <button type="button" className="link-btn" onClick={() => exportSavedCraft(savedCraft)}>
+                        Export
+                      </button>
+                      <button type="button" className="link-btn" onClick={() => deleteSavedCraft(savedCraft.id)}>
+                        Delete
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
           </div>
-
-          <div className="settings-card settings-card-wide">
-            <div className="settings-card-header">
-              <h3>Daily Bonuses</h3>
-              <p>Two optional production bonuses applied to matching craft categories.</p>
-            </div>
-            <div className="daily-bonus-grid">
-              <label>
-                Daily Bonus A
-                <select
-                  value={safeSettings.dailyBonusA.category}
-                  onChange={(event) =>
-                    updateSettings('dailyBonusA', {
-                      ...safeSettings.dailyBonusA,
-                      category: event.target.value,
-                    })
-                  }
-                >
-                  {DAILY_BONUS_OPTIONS.map((option) => (
-                    <option key={`bonus-a-${option.value || 'none'}`} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Bonus A %
-                <select
-                  value={safeSettings.dailyBonusA.percent}
-                  onChange={(event) =>
-                    updateSettings('dailyBonusA', {
-                      ...safeSettings.dailyBonusA,
-                      percent: Number(event.target.value) as 10 | 20,
-                    })
-                  }
-                >
-                  <option value={10}>10%</option>
-                  <option value={20}>20%</option>
-                </select>
-              </label>
-
-              <label>
-                Daily Bonus B
-                <select
-                  value={safeSettings.dailyBonusB.category}
-                  onChange={(event) =>
-                    updateSettings('dailyBonusB', {
-                      ...safeSettings.dailyBonusB,
-                      category: event.target.value,
-                    })
-                  }
-                >
-                  {DAILY_BONUS_OPTIONS.map((option) => (
-                    <option key={`bonus-b-${option.value || 'none'}`} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label>
-                Bonus B %
-                <select
-                  value={safeSettings.dailyBonusB.percent}
-                  onChange={(event) =>
-                    updateSettings('dailyBonusB', {
-                      ...safeSettings.dailyBonusB,
-                      percent: Number(event.target.value) as 10 | 20,
-                    })
-                  }
-                >
-                  <option value={10}>10%</option>
-                  <option value={20}>20%</option>
-                </select>
-              </label>
-            </div>
-          </div>
-        </div>
-      </section>
+        </aside>
+      </div>
 
       <section className="summary-cards">
         <article className="summary-card">
           <h4>Planned Crafts</h4>
           <p>{plannedView.summary.plannedCrafts}</p>
         </article>
-        <article className="summary-card">
+        <article className="summary-card" title={summaryCardTitles.cost}>
           <h4>Total Cost</h4>
           <p>{formatSilver(plannedView.summary.totalCost)}</p>
         </article>
-        <article className="summary-card">
+        <article className="summary-card" title={summaryCardTitles.revenue}>
           <h4>Total Revenue</h4>
           <p>{formatSilver(plannedView.summary.totalRevenue)}</p>
         </article>
-        <article className={`summary-card ${plannedView.summary.totalProfit >= 0 ? 'profit' : 'loss'}`}>
+        <article
+          className={`summary-card ${plannedView.summary.totalProfit >= 0 ? 'profit' : 'loss'}`}
+          title={summaryCardTitles.profit}
+        >
           <h4>Total Profit</h4>
           <p>{formatSilver(plannedView.summary.totalProfit)}</p>
         </article>
@@ -1768,6 +2523,9 @@ function App() {
                   const infoTitle = buildCollapsedInfoTitle(result)
                   const displayCategory = searchCategoryByItemId.get(result.baseItem.itemId)
                   const outputPricePoint = getCachedPoint(priceBook, safeSettings, result.sellCity, result.variant.marketItemId)
+                  const materialLinesSorted = [...result.materialLines].sort(compareMaterialLines)
+                  const materialQuantityTotal = materialLinesSorted.reduce((sum, line) => sum + line.quantity, 0)
+                  const materialCostTotal = materialLinesSorted.reduce((sum, line) => sum + (line.totalCost ?? 0), 0)
 
                   return (
                     <Fragment key={result.plan.variantId}>
@@ -1990,7 +2748,7 @@ function App() {
                                   {result.materialLines.map((line) => (
                                     <MarketHistoryCard
                                       key={`${result.plan.variantId}-${line.marketItemId}-${line.buyCity}-history`}
-                                      title={line.displayName}
+                                      title={formatNameWithTier(line.displayName, line.marketItemId)}
                                       subtitle={line.isArtifact ? 'Artifact input' : MATERIAL_GROUP_LABELS[line.materialGroup ?? 'other']}
                                       location={line.buyCity}
                                       selectedPrice={line.unitPrice}
@@ -2044,6 +2802,18 @@ function App() {
                                           <td>{formatSilver(result.journalLine.netValue)}</td>
                                         </tr>
                                       </tbody>
+                                      <tfoot>
+                                        <tr className="table-summary-row">
+                                          <td>Total</td>
+                                          <td>{result.journalLine.fullDisplayName}</td>
+                                          <td>{DECIMAL_FORMATTER.format(result.journalLine.amount)}</td>
+                                          <td>{result.journalLine.buyCity}</td>
+                                          <td>{result.journalLine.sellCity}</td>
+                                          <td>{formatSilver(result.journalLine.buyTotalCost)}</td>
+                                          <td>{formatSilver(result.journalLine.sellTotalRevenue)}</td>
+                                          <td>{formatSilver(result.journalLine.netValue)}</td>
+                                        </tr>
+                                      </tfoot>
                                     </table>
                                   </div>
                                 </div>
@@ -2063,9 +2833,9 @@ function App() {
                                       </tr>
                                     </thead>
                                     <tbody>
-                                      {result.materialLines.map((line) => (
+                                      {materialLinesSorted.map((line) => (
                                         <tr key={`${result.plan.variantId}-${line.marketItemId}-${line.buyCity}`}>
-                                          <td>{line.displayName}</td>
+                                          <td>{formatNameWithTier(line.displayName, line.marketItemId)}</td>
                                           <td>{line.buyCity}</td>
                                           <td>{DECIMAL_FORMATTER.format(line.quantity)}</td>
                                           <td>{formatSilver(line.unitPrice)}</td>
@@ -2073,6 +2843,15 @@ function App() {
                                         </tr>
                                       ))}
                                     </tbody>
+                                    <tfoot>
+                                      <tr className="table-summary-row">
+                                        <td>Total</td>
+                                        <td>All</td>
+                                        <td>{DECIMAL_FORMATTER.format(materialQuantityTotal)}</td>
+                                        <td>--</td>
+                                        <td>{formatSilver(materialCostTotal)}</td>
+                                      </tr>
+                                    </tfoot>
                                   </table>
                                 </div>
                               </div>
@@ -2160,6 +2939,15 @@ function App() {
                       </tr>
                     ))}
                   </tbody>
+                  <tfoot>
+                    <tr className="table-summary-row">
+                      <td>Total</td>
+                      <td>All</td>
+                      <td>{DECIMAL_FORMATTER.format(breakdown.inputTotals.quantity)}</td>
+                      <td>--</td>
+                      <td>{formatSilver(breakdown.inputTotals.totalCost)}</td>
+                    </tr>
+                  </tfoot>
                 </table>
               </div>
             </div>
@@ -2180,9 +2968,9 @@ function App() {
                         <th>Net</th>
                       </tr>
                     </thead>
-                    <tbody>
-                      {breakdown.journals.map((entry) => (
-                        <tr key={`${entry.label}-${entry.buyCity}-${entry.sellCity}`}>
+                  <tbody>
+                    {breakdown.journals.map((entry) => (
+                      <tr key={`${entry.label}-${entry.buyCity}-${entry.sellCity}`}>
                           <td>{entry.label}</td>
                           <td>{DECIMAL_FORMATTER.format(entry.amount)}</td>
                           <td>{entry.buyCity}</td>
@@ -2190,16 +2978,31 @@ function App() {
                           <td>{formatSilver(entry.buyCost)}</td>
                           <td>{formatSilver(entry.sellRevenue)}</td>
                           <td>{formatSilver(entry.sellRevenue - entry.buyCost)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr className="table-summary-row">
+                      <td>Total</td>
+                      <td>{DECIMAL_FORMATTER.format(breakdown.journalTotals.amount)}</td>
+                      <td>All</td>
+                      <td>All</td>
+                      <td>{formatSilver(breakdown.journalTotals.buyCost)}</td>
+                      <td>{formatSilver(breakdown.journalTotals.sellRevenue)}</td>
+                      <td>{formatSilver(breakdown.journalTotals.sellRevenue - breakdown.journalTotals.buyCost)}</td>
+                    </tr>
+                  </tfoot>
+                </table>
               </div>
+            </div>
             )}
           </div>
         )}
       </section>
+        </>
+      ) : (
+        <RefiningCalculatorTab gameData={gameData} />
+      )}
     </div>
   )
 }

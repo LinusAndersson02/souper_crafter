@@ -4,6 +4,8 @@ import {
   type CraftItem,
   type EnchantmentLevel,
   type GameData,
+  type MaterialGroup,
+  type RefiningItem,
   type RecipeResource,
   type RoyalClusterId,
 } from './types'
@@ -22,6 +24,7 @@ interface CraftingModifiersFile {
 
 interface CleanDataFile {
   items: CraftItem[]
+  refiningItems?: RefiningItem[]
   cityProfiles: CityProfile[]
   knownMarketItemIds?: string[]
 }
@@ -61,6 +64,7 @@ const BLACK_MARKET_CATEGORY_ALLOWLIST = new Set([
   'bag',
   'cape',
 ])
+const REFINING_CATEGORY_ALLOWLIST = new Set<MaterialGroup>(['wood', 'fiber', 'hide', 'ore'])
 
 function toArray<T>(value: T | T[] | undefined | null): T[] {
   if (value == null) {
@@ -243,6 +247,17 @@ function resolveMarketIdForEnchantment(
   return null
 }
 
+function toMarketItemId(itemId: string, enchantment: number, knownMarketItemIds: Set<string>): string {
+  if (enchantment > 0) {
+    const candidate = `${itemId}@${enchantment}`
+    if (knownMarketItemIds.has(candidate)) {
+      return candidate
+    }
+  }
+
+  return itemId
+}
+
 function normalizeAvailableEnchantments(
   itemId: string,
   knownMarketItemIds: Set<string>,
@@ -389,6 +404,31 @@ function computeRequirementFame(
     }, 0)
 }
 
+function computeRequirementItemValue(
+  requirement: UnknownRecord | null,
+  rawItemsById: Map<string, UnknownRecord>,
+  itemValueMemo: Map<string, number>,
+): number {
+  if (!requirement) {
+    return 0
+  }
+
+  const amountCrafted = Math.max(1, parseNumber(requirement['@amountcrafted'], 1))
+  const totalValue = toArray(requirement.craftresource)
+    .map((resource) => asRecord(resource))
+    .filter((resource): resource is UnknownRecord => resource !== null)
+    .reduce((sum, resource) => {
+      const resourceItemId = resolveResourceItemId(resource, rawItemsById)
+      if (resourceItemId.length === 0) {
+        return sum
+      }
+
+      return sum + computeItemValue(resourceItemId, rawItemsById, itemValueMemo) * parseNumber(resource['@count'], 0)
+    }, 0)
+
+  return totalValue / amountCrafted
+}
+
 function computeItemFame(
   itemId: string,
   rawItemsById: Map<string, UnknownRecord>,
@@ -415,6 +455,29 @@ function computeItemFame(
 
   fameMemo.set(itemId, fameValue)
   return fameValue
+}
+
+function computeItemValue(
+  itemId: string,
+  rawItemsById: Map<string, UnknownRecord>,
+  itemValueMemo: Map<string, number>,
+): number {
+  if (itemValueMemo.has(itemId)) {
+    return itemValueMemo.get(itemId) ?? 0
+  }
+
+  const rawItem = rawItemsById.get(itemId)
+  if (!rawItem) {
+    itemValueMemo.set(itemId, 0)
+    return 0
+  }
+
+  const directValue = parsePositiveNumber(rawItem['@itemvalue'])
+  const requirement = chooseCraftingRequirement(rawItem.craftingrequirements)
+  const itemValue = directValue ?? computeRequirementItemValue(requirement, rawItemsById, itemValueMemo)
+
+  itemValueMemo.set(itemId, itemValue)
+  return itemValue
 }
 
 function parseJournalDefinitions(
@@ -510,7 +573,9 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
   const parsedTier = parseNumber(raw.tier, Number.NaN)
   const rawJournal = asRecord(raw.journal)
   const rawFameByEnchantment = asRecord(rawJournal?.fameByEnchantment)
+  const rawItemValueByEnchantment = asRecord(raw.itemValueByEnchantment)
   const fameByEnchantment: Partial<Record<EnchantmentLevel, number>> = {}
+  const itemValueByEnchantment: Partial<Record<EnchantmentLevel, number>> = {}
 
   if (rawFameByEnchantment) {
     for (const [key, value] of Object.entries(rawFameByEnchantment)) {
@@ -523,6 +588,21 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
     }
   }
 
+  if (rawItemValueByEnchantment) {
+    for (const [key, value] of Object.entries(rawItemValueByEnchantment)) {
+      const enchantment = parseNumber(key, Number.NaN)
+      if (!Number.isFinite(enchantment) || enchantment < 0 || enchantment > 4) {
+        continue
+      }
+
+      itemValueByEnchantment[enchantment as EnchantmentLevel] = parseNumber(value, 0)
+    }
+  }
+
+  if (itemValueByEnchantment[0] === undefined) {
+    itemValueByEnchantment[0] = parseNumber(raw.itemValue, 0)
+  }
+
   return {
     itemId,
     displayName: displayName.length > 0 ? displayName : itemId,
@@ -530,6 +610,7 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
     craftingCategory: category,
     weight: parseNumber(raw.weight, 0),
     itemValue: parseNumber(raw.itemValue, 0),
+    itemValueByEnchantment,
     recipe,
     availableEnchantments: [0],
     journal: rawJournal
@@ -543,6 +624,48 @@ function normalizeCraftItem(item: unknown): CraftItem | null {
           fameByEnchantment,
         }
       : null,
+  }
+}
+
+function normalizeRefiningItem(item: unknown): RefiningItem | null {
+  const raw = asRecord(item)
+  if (!raw) {
+    return null
+  }
+
+  const itemId = typeof raw.itemId === 'string' ? raw.itemId.trim() : ''
+  const marketItemId = typeof raw.marketItemId === 'string' ? raw.marketItemId.trim() : itemId
+  const displayName = typeof raw.displayName === 'string' ? raw.displayName.trim() : marketItemId
+  const category = typeof raw.craftingCategory === 'string' ? raw.craftingCategory.trim() : ''
+
+  if (!itemId || !marketItemId || !REFINING_CATEGORY_ALLOWLIST.has(category as MaterialGroup)) {
+    return null
+  }
+
+  const recipe = toArray(raw.recipe)
+    .map((resource) => normalizeRecipeResource(resource))
+    .filter((resource): resource is RecipeResource => resource !== null)
+
+  if (recipe.length === 0) {
+    return null
+  }
+
+  const tierValue = parseNumber(raw.tier, Number.NaN)
+  const enchantment = parseNumber(raw.enchantment, Number.NaN)
+  if (!Number.isFinite(enchantment) || enchantment < 0 || enchantment > 4) {
+    return null
+  }
+
+  return {
+    itemId,
+    marketItemId,
+    displayName: displayName.length > 0 ? displayName : marketItemId,
+    tier: Number.isFinite(tierValue) ? tierValue : null,
+    enchantment: enchantment as EnchantmentLevel,
+    craftingCategory: category as MaterialGroup,
+    weight: parseNumber(raw.weight, 0),
+    itemValue: parseNumber(raw.itemValue, 0),
+    recipe,
   }
 }
 
@@ -575,6 +698,7 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
 
   const rawItemsById = buildRawItemIndex(itemsFile)
   const fameMemo = new Map<string, number>()
+  const itemValueMemo = new Map<string, number>()
   const journalDefinitions = parseJournalDefinitions(rawItemsById, nameMap)
   const byItemId = new Map<string, CraftItem>()
 
@@ -608,30 +732,38 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
       const tierValue = parseNumber(rawItem['@tier'], Number.NaN)
       const journalDefinition = journalDefinitions.get(itemId) ?? null
       const fameByEnchantment: Partial<Record<EnchantmentLevel, number>> = {}
+      const itemValueByEnchantment: Partial<Record<EnchantmentLevel, number>> = {}
       if (journalDefinition) {
         fameByEnchantment[0] = computeItemFame(itemId, rawItemsById, fameMemo)
       }
+      itemValueByEnchantment[0] = computeItemValue(itemId, rawItemsById, itemValueMemo)
 
-      if (journalDefinition) {
-        for (const rawEnchantment of toArray(asRecord(rawItem.enchantments)?.enchantment)) {
-          const enchantmentEntry = asRecord(rawEnchantment)
-          if (!enchantmentEntry) {
-            continue
-          }
-
-          const enchantmentLevel = parseNumber(enchantmentEntry['@enchantmentlevel'], Number.NaN)
-          if (!Number.isFinite(enchantmentLevel) || enchantmentLevel < 1 || enchantmentLevel > 4) {
-            continue
-          }
-
-          const enchantmentRequirement = chooseCraftingRequirement(enchantmentEntry.craftingrequirements)
-          const baseFame = computeRequirementFame(enchantmentRequirement, rawItemsById, fameMemo)
-          const fameFactor =
-            parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
-            parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
-            1
-          fameByEnchantment[enchantmentLevel as EnchantmentLevel] = baseFame * fameFactor
+      for (const rawEnchantment of toArray(asRecord(rawItem.enchantments)?.enchantment)) {
+        const enchantmentEntry = asRecord(rawEnchantment)
+        if (!enchantmentEntry) {
+          continue
         }
+
+        const enchantmentLevel = parseNumber(enchantmentEntry['@enchantmentlevel'], Number.NaN)
+        if (!Number.isFinite(enchantmentLevel) || enchantmentLevel < 1 || enchantmentLevel > 4) {
+          continue
+        }
+
+        const enchantmentRequirement = chooseCraftingRequirement(enchantmentEntry.craftingrequirements)
+        itemValueByEnchantment[enchantmentLevel as EnchantmentLevel] =
+          parsePositiveNumber(enchantmentEntry['@itemvalue']) ??
+          computeRequirementItemValue(enchantmentRequirement, rawItemsById, itemValueMemo)
+
+        if (!journalDefinition) {
+          continue
+        }
+
+        const baseFame = computeRequirementFame(enchantmentRequirement, rawItemsById, fameMemo)
+        const fameFactor =
+          parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
+          parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
+          1
+        fameByEnchantment[enchantmentLevel as EnchantmentLevel] = baseFame * fameFactor
       }
 
       byItemId.set(itemId, {
@@ -640,7 +772,8 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
         tier: Number.isFinite(tierValue) ? tierValue : null,
         craftingCategory,
         weight: parseNumber(rawItem['@weight'], 0),
-        itemValue: parseNumber(rawItem['@itemvalue'], 0),
+        itemValue: itemValueByEnchantment[0] ?? parseNumber(rawItem['@itemvalue'], 0),
+        itemValueByEnchantment,
         recipe,
         availableEnchantments: [0],
         journal: journalDefinition
@@ -654,6 +787,91 @@ function parseCraftItems(itemsFile: ItemsFile, nameMap: Map<string, string>): Cr
   }
 
   return [...byItemId.values()]
+}
+
+function parseRefiningItems(itemsFile: ItemsFile, nameMap: Map<string, string>, knownMarketItemIds: Set<string>): RefiningItem[] {
+  const itemsRoot = asRecord(itemsFile.items)
+  if (!itemsRoot) {
+    return []
+  }
+
+  const rawItemsById = buildRawItemIndex(itemsFile)
+  const refiningItems: RefiningItem[] = []
+
+  for (const [bucketName, bucketValue] of Object.entries(itemsRoot)) {
+    if (bucketName.startsWith('@') || bucketName === 'shopcategories') {
+      continue
+    }
+
+    for (const candidate of toArray(bucketValue)) {
+      const rawItem = asRecord(candidate)
+      if (!rawItem) {
+        continue
+      }
+
+      const itemId = typeof rawItem['@uniquename'] === 'string' ? rawItem['@uniquename'] : ''
+      const category = normalizeCategory(rawItem)
+      const showInMarketplace = rawItem['@showinmarketplace'] !== 'false'
+
+      if (
+        itemId.length === 0 ||
+        !showInMarketplace ||
+        rawItem['@shopsubcategory1'] !== 'refinedresources' ||
+        !REFINING_CATEGORY_ALLOWLIST.has(category as MaterialGroup)
+      ) {
+        continue
+      }
+
+      const recipe = toArray(chooseCraftingRequirement(rawItem.craftingrequirements)?.craftresource)
+        .map((resource) => asRecord(resource))
+        .filter((resource): resource is UnknownRecord => resource !== null)
+        .map((resource) => {
+          const resourceId = resolveResourceItemId(resource, rawItemsById)
+          const count = parseNumber(resource['@count'], 0)
+
+          return {
+            itemId: resourceId,
+            count,
+            displayName: nameMap.get(resourceId) ?? resourceId,
+          }
+        })
+        .filter((resource) => resource.itemId.length > 0 && resource.count > 0)
+
+      if (recipe.length === 0) {
+        continue
+      }
+
+      const enchantment = parseNumber(rawItem['@enchantmentlevel'], 0)
+      refiningItems.push({
+        itemId,
+        marketItemId: toMarketItemId(itemId, enchantment, knownMarketItemIds),
+        displayName: nameMap.get(toMarketItemId(itemId, enchantment, knownMarketItemIds)) ?? nameMap.get(itemId) ?? itemId,
+        tier: parseNumber(rawItem['@tier'], Number.NaN),
+        enchantment: enchantment as EnchantmentLevel,
+        craftingCategory: category as MaterialGroup,
+        weight: parseNumber(rawItem['@weight'], 0),
+        itemValue: parseNumber(rawItem['@itemvalue'], 0),
+        recipe,
+      })
+    }
+  }
+
+  return refiningItems.sort((a, b) => {
+    const categoryComparison = a.craftingCategory.localeCompare(b.craftingCategory)
+    if (categoryComparison !== 0) {
+      return categoryComparison
+    }
+
+    if ((a.tier ?? 0) !== (b.tier ?? 0)) {
+      return (a.tier ?? 0) - (b.tier ?? 0)
+    }
+
+    if (a.enchantment !== b.enchantment) {
+      return a.enchantment - b.enchantment
+    }
+
+    return a.displayName.localeCompare(b.displayName)
+  })
 }
 
 function normalizeCityProfile(cityProfile: unknown): CityProfile | null {
@@ -766,6 +984,7 @@ function enrichEnchantments(items: CraftItem[], knownMarketItemIds: Set<string>)
 
 function finalizeGameData(
   items: CraftItem[],
+  refiningItems: RefiningItem[],
   cityProfiles: CityProfile[],
   knownMarketItemIds: Set<string>,
 ): GameData {
@@ -776,6 +995,7 @@ function finalizeGameData(
 
   return {
     items: enrichedItems,
+    refiningItems,
     cityProfiles,
     categoryPresetCity: createCategoryPresetMap(cityProfiles),
     categories,
@@ -810,16 +1030,19 @@ async function loadCleanedData(): Promise<GameData> {
   const items = toArray(file.items)
     .map((item) => normalizeCraftItem(item))
     .filter((item): item is CraftItem => item !== null)
+  const refiningItems = toArray(file.refiningItems)
+    .map((item) => normalizeRefiningItem(item))
+    .filter((item): item is RefiningItem => item !== null)
 
   const cityProfiles = toArray(file.cityProfiles)
     .map((cityProfile) => normalizeCityProfile(cityProfile))
     .filter((cityProfile): cityProfile is CityProfile => cityProfile !== null)
 
-  if (items.length === 0 || cityProfiles.length === 0) {
+  if (items.length === 0 || cityProfiles.length === 0 || refiningItems.length === 0) {
     throw new Error('Cleaned crafting-data.json is missing required data.')
   }
 
-  return finalizeGameData(items, cityProfiles, knownMarketItemIds)
+  return finalizeGameData(items, refiningItems, cityProfiles, knownMarketItemIds)
 }
 
 async function loadLegacyData(): Promise<GameData> {
@@ -835,8 +1058,9 @@ async function loadLegacyData(): Promise<GameData> {
 
   const cityProfiles = parseCityProfiles(modifiersFile, worldMap)
   const items = parseCraftItems(itemsFile, itemNameMap)
+  const refiningItems = parseRefiningItems(itemsFile, itemNameMap, knownMarketItemIds)
 
-  return finalizeGameData(items, cityProfiles, knownMarketItemIds)
+  return finalizeGameData(items, refiningItems, cityProfiles, knownMarketItemIds)
 }
 
 export async function loadGameData(): Promise<GameData> {

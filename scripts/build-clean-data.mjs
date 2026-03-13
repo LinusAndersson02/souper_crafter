@@ -40,6 +40,7 @@ const BLACK_MARKET_CATEGORY_ALLOWLIST = new Set([
   'bag',
   'cape',
 ])
+const REFINING_CATEGORY_ALLOWLIST = new Set(['wood', 'fiber', 'hide', 'ore'])
 
 function toArray(value) {
   if (value == null) {
@@ -321,6 +322,29 @@ function computeRequirementFame(requirement, rawItemsById, fameMemo) {
     }, 0)
 }
 
+function computeRequirementItemValue(requirement, rawItemsById, itemValueMemo) {
+  const rawRequirement = asRecord(requirement)
+  if (!rawRequirement) {
+    return 0
+  }
+
+  const amountCrafted = Math.max(1, parseNumber(rawRequirement['@amountcrafted'], 1))
+
+  const totalValue = toArray(rawRequirement.craftresource)
+    .map((resource) => asRecord(resource))
+    .filter(Boolean)
+    .reduce((sum, resource) => {
+      const resourceItemId = resolveResourceItemId(resource, rawItemsById)
+      if (!resourceItemId) {
+        return sum
+      }
+
+      return sum + computeItemValue(resourceItemId, rawItemsById, itemValueMemo) * parseNumber(resource['@count'], 0)
+    }, 0)
+
+  return totalValue / amountCrafted
+}
+
 function computeItemFame(itemId, rawItemsById, fameMemo) {
   if (!itemId) {
     return 0
@@ -347,6 +371,29 @@ function computeItemFame(itemId, rawItemsById, fameMemo) {
 
   fameMemo.set(itemId, fameValue)
   return fameValue
+}
+
+function computeItemValue(itemId, rawItemsById, itemValueMemo) {
+  if (!itemId) {
+    return 0
+  }
+
+  if (itemValueMemo.has(itemId)) {
+    return itemValueMemo.get(itemId)
+  }
+
+  const rawItem = rawItemsById.get(itemId)
+  if (!rawItem) {
+    itemValueMemo.set(itemId, 0)
+    return 0
+  }
+
+  const directValue = parsePositiveNumber(rawItem['@itemvalue'])
+  const requirement = chooseCraftingRequirement(rawItem.craftingrequirements)
+  const itemValue = directValue ?? computeRequirementItemValue(requirement, rawItemsById, itemValueMemo)
+
+  itemValueMemo.set(itemId, itemValue)
+  return itemValue
 }
 
 function parseJournalDefinitions(rawItemsById, nameMap) {
@@ -388,6 +435,17 @@ function parseJournalDefinitions(rawItemsById, nameMap) {
   return journalByItemId
 }
 
+function toMarketItemId(itemId, enchantmentLevel, knownMarketItemIds) {
+  if (enchantmentLevel > 0) {
+    const enchantedId = `${itemId}@${enchantmentLevel}`
+    if (knownMarketItemIds.has(enchantedId)) {
+      return enchantedId
+    }
+  }
+
+  return itemId
+}
+
 function parseItems(itemsFile, nameMap, knownMarketItemIds) {
   const itemsRoot = asRecord(itemsFile.items)
   if (!itemsRoot) {
@@ -396,6 +454,7 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
 
   const rawItemsById = buildRawItemIndex(itemsFile)
   const fameMemo = new Map()
+  const itemValueMemo = new Map()
   const journalDefinitions = parseJournalDefinitions(rawItemsById, nameMap)
   const byId = new Map()
 
@@ -444,9 +503,11 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
       const availableEnchantments = [0]
       const journalDefinition = journalDefinitions.get(itemId) ?? null
       const fameByEnchantment = {}
+      const itemValueByEnchantment = {}
       if (journalDefinition) {
         fameByEnchantment[0] = computeItemFame(itemId, rawItemsById, fameMemo)
       }
+      itemValueByEnchantment[0] = computeItemValue(itemId, rawItemsById, itemValueMemo)
 
       for (const enchantment of [1, 2, 3, 4]) {
         if (resolveMarketIdForEnchantment(itemId, enchantment, knownMarketItemIds)) {
@@ -454,26 +515,32 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
         }
       }
 
-      if (journalDefinition) {
-        for (const rawEnchantment of toArray(asRecord(rawItem.enchantments)?.enchantment)) {
-          const enchantmentEntry = asRecord(rawEnchantment)
-          if (!enchantmentEntry) {
-            continue
-          }
-
-          const enchantmentLevel = parseNumber(enchantmentEntry['@enchantmentlevel'], Number.NaN)
-          if (!Number.isFinite(enchantmentLevel) || enchantmentLevel < 1 || enchantmentLevel > 4) {
-            continue
-          }
-
-          const enchantmentRequirement = chooseCraftingRequirement(enchantmentEntry.craftingrequirements)
-          const baseFame = computeRequirementFame(enchantmentRequirement, rawItemsById, fameMemo)
-          const fameFactor =
-            parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
-            parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
-            1
-          fameByEnchantment[enchantmentLevel] = baseFame * fameFactor
+      for (const rawEnchantment of toArray(asRecord(rawItem.enchantments)?.enchantment)) {
+        const enchantmentEntry = asRecord(rawEnchantment)
+        if (!enchantmentEntry) {
+          continue
         }
+
+        const enchantmentLevel = parseNumber(enchantmentEntry['@enchantmentlevel'], Number.NaN)
+        if (!Number.isFinite(enchantmentLevel) || enchantmentLevel < 1 || enchantmentLevel > 4) {
+          continue
+        }
+
+        const enchantmentRequirement = chooseCraftingRequirement(enchantmentEntry.craftingrequirements)
+        itemValueByEnchantment[enchantmentLevel] =
+          parsePositiveNumber(enchantmentEntry['@itemvalue']) ??
+          computeRequirementItemValue(enchantmentRequirement, rawItemsById, itemValueMemo)
+
+        if (!journalDefinition) {
+          continue
+        }
+
+        const baseFame = computeRequirementFame(enchantmentRequirement, rawItemsById, fameMemo)
+        const fameFactor =
+          parsePositiveNumber(rawItem['@destinyandjournalcraftfamefactor']) ??
+          parsePositiveNumber(rawItem['@destinycraftfamefactor']) ??
+          1
+        fameByEnchantment[enchantmentLevel] = baseFame * fameFactor
       }
 
       const tier = parseNumber(rawItem['@tier'], Number.NaN)
@@ -484,7 +551,8 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
         tier: Number.isFinite(tier) ? tier : null,
         craftingCategory,
         weight: parseNumber(rawItem['@weight'], 0),
-        itemValue: parseNumber(rawItem['@itemvalue'], 0),
+        itemValue: itemValueByEnchantment[0] ?? parseNumber(rawItem['@itemvalue'], 0),
+        itemValueByEnchantment,
         recipe,
         availableEnchantments,
         journal: journalDefinition
@@ -498,6 +566,93 @@ function parseItems(itemsFile, nameMap, knownMarketItemIds) {
   }
 
   return [...byId.values()]
+}
+
+function parseRefiningItems(itemsFile, nameMap, knownMarketItemIds) {
+  const itemsRoot = asRecord(itemsFile.items)
+  if (!itemsRoot) {
+    return []
+  }
+
+  const rawItemsById = buildRawItemIndex(itemsFile)
+  const refiningItems = []
+
+  for (const [bucketName, bucketValue] of Object.entries(itemsRoot)) {
+    if (bucketName.startsWith('@') || bucketName === 'shopcategories') {
+      continue
+    }
+
+    for (const candidate of toArray(bucketValue)) {
+      const rawItem = asRecord(candidate)
+      if (!rawItem) {
+        continue
+      }
+
+      const itemId = typeof rawItem['@uniquename'] === 'string' ? rawItem['@uniquename'] : ''
+      const craftingCategory = normalizeCategory(rawItem)
+      const showInMarketplace = rawItem['@showinmarketplace'] !== 'false'
+
+      if (
+        !itemId ||
+        !showInMarketplace ||
+        !REFINING_CATEGORY_ALLOWLIST.has(craftingCategory) ||
+        rawItem['@shopsubcategory1'] !== 'refinedresources'
+      ) {
+        continue
+      }
+
+      const craftingRequirements = chooseCraftingRequirement(rawItem.craftingrequirements)
+      const recipe = toArray(craftingRequirements?.craftresource)
+        .map((resource) => asRecord(resource))
+        .filter((resource) => resource !== null)
+        .map((resource) => {
+          const resourceId = resolveResourceItemId(resource, rawItemsById)
+          const count = parseNumber(resource['@count'], 0)
+
+          return {
+            itemId: resourceId,
+            count,
+            displayName: nameMap.get(resourceId) ?? resourceId,
+          }
+        })
+        .filter((resource) => resource.itemId.length > 0 && resource.count > 0)
+
+      if (recipe.length === 0) {
+        continue
+      }
+
+      const enchantment = parseNumber(rawItem['@enchantmentlevel'], 0)
+
+      refiningItems.push({
+        itemId,
+        marketItemId: toMarketItemId(itemId, enchantment, knownMarketItemIds),
+        displayName: nameMap.get(toMarketItemId(itemId, enchantment, knownMarketItemIds)) ?? nameMap.get(itemId) ?? itemId,
+        tier: parseNumber(rawItem['@tier'], Number.NaN),
+        enchantment,
+        craftingCategory,
+        weight: parseNumber(rawItem['@weight'], 0),
+        itemValue: parseNumber(rawItem['@itemvalue'], 0),
+        recipe,
+      })
+    }
+  }
+
+  return refiningItems.sort((a, b) => {
+    const categoryComparison = a.craftingCategory.localeCompare(b.craftingCategory)
+    if (categoryComparison !== 0) {
+      return categoryComparison
+    }
+
+    if (a.tier !== b.tier) {
+      return a.tier - b.tier
+    }
+
+    if (a.enchantment !== b.enchantment) {
+      return a.enchantment - b.enchantment
+    }
+
+    return a.displayName.localeCompare(b.displayName)
+  })
 }
 
 function parseCityProfiles(modifiersFile, worldMap) {
@@ -558,11 +713,13 @@ async function main() {
   const worldMap = parseWorldMap(worldText)
 
   const items = parseItems(itemsFile, nameMap, knownMarketItemIds)
+  const refiningItems = parseRefiningItems(itemsFile, nameMap, knownMarketItemIds)
   const cityProfiles = parseCityProfiles(modifiersFile, worldMap)
 
   const cleanedData = {
     generatedAt: new Date().toISOString(),
     items,
+    refiningItems,
     cityProfiles,
     knownMarketItemIds: [...knownMarketItemIds],
   }
@@ -573,7 +730,9 @@ async function main() {
   const cleanBytes = Buffer.byteLength(JSON.stringify(cleanedData))
   const reduction = ((1 - cleanBytes / rawBytes) * 100).toFixed(1)
 
-  console.log(`Wrote public/crafting-data.json with ${items.length} items and ${cityProfiles.length} cities.`)
+  console.log(
+    `Wrote public/crafting-data.json with ${items.length} craft items, ${refiningItems.length} refining items, and ${cityProfiles.length} cities.`,
+  )
   console.log(`Source bytes: ${rawBytes.toLocaleString()} | Clean bytes: ${cleanBytes.toLocaleString()} | Reduced: ${reduction}%`)
 }
 

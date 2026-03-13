@@ -35,9 +35,22 @@ export interface CraftItem {
   craftingCategory: string
   weight: number
   itemValue: number
+  itemValueByEnchantment: Partial<Record<EnchantmentLevel, number>>
   recipe: RecipeResource[]
   availableEnchantments: EnchantmentLevel[]
   journal: CraftJournalInfo | null
+}
+
+export interface RefiningItem {
+  itemId: string
+  marketItemId: string
+  displayName: string
+  tier: number | null
+  enchantment: EnchantmentLevel
+  craftingCategory: MaterialGroup
+  weight: number
+  itemValue: number
+  recipe: RecipeResource[]
 }
 
 export interface CraftJournalInfo {
@@ -79,6 +92,7 @@ export interface CityProfile {
 
 export interface GameData {
   items: CraftItem[]
+  refiningItems: RefiningItem[]
   cityProfiles: CityProfile[]
   categoryPresetCity: Record<string, string>
   categories: string[]
@@ -106,6 +120,8 @@ export interface AppSettings {
   serverRegion: ServerRegion
   hasPremium: boolean
   targetCity: SellTarget
+  includeJournals: boolean
+  craftingStationFeePer100Nutrition: number
   transportEmvPct: number
   transportSilverPerKg: number
   dailyBonusA: DailyBonusSetting
@@ -116,6 +132,8 @@ export interface CachedPricePoint {
   estimated: number | null
   sellOrder: number | null
   buyOrder: number | null
+  sellOrderUpdatedAt: string | null
+  buyOrderUpdatedAt: string | null
   avgSoldPerDay30d: number | null
   avgPrice30d: number | null
   history30d: PriceHistoryPoint[]
@@ -170,6 +188,7 @@ export interface PlannedCraftResult {
   missingPrices: string[]
   estimatedMarketValue: number | null
   sellPriceUnit: number | null
+  priceAgeHours: number | null
   avgSoldPerDay30d: number | null
   avgPrice30d: number | null
   materialBaseCost: number | null
@@ -179,6 +198,7 @@ export interface PlannedCraftResult {
   journalRevenue: number | null
   itemValuePerCraft: number | null
   stationNutrition: number | null
+  stationFee: number | null
   marketFee: number | null
   transportFee: number | null
   totalCost: number | null
@@ -192,6 +212,7 @@ export interface CraftPlanSummary {
   readyCrafts: number
   totalCost: number
   totalRevenue: number
+  totalStationFee: number
   totalMarketFee: number
   totalProfit: number
   totalProfitPct: number | null

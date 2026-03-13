@@ -66,6 +66,34 @@ h1 {
   font-size: 0.93rem;
 }
 
+.app-tab-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-top: 0.9rem;
+  padding: 0.3rem;
+  border-radius: 999px;
+  background: var(--bg-1);
+}
+
+.app-tab {
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  min-width: 8.5rem;
+  height: 2.35rem;
+  padding: 0 0.95rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.app-tab.active {
+  background: var(--field);
+  color: var(--text);
+}
+
 .refresh-btn {
   border: none;
   color: var(--text);
@@ -91,9 +119,17 @@ h1 {
 
 .picker-panel,
 .settings-panel,
-.table-panel {
+.table-panel,
+.saved-crafts-panel {
   margin-bottom: 1rem;
   padding: 0.95rem;
+}
+
+.top-control-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.85fr) minmax(300px, 0.95fr);
+  gap: 1rem;
+  align-items: start;
 }
 
 .panel-title-row {
@@ -309,8 +345,26 @@ button:focus {
 
 .global-bar-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 0.75rem;
+  align-items: end;
+}
+
+.settings-action {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.79rem;
+  font-weight: 600;
+}
+
+.settings-action .refresh-btn {
+  width: 100%;
+  min-width: 0;
+  height: 2.35rem;
+  border-radius: 0.55rem;
 }
 
 .transport-grid {
@@ -361,6 +415,65 @@ button:focus {
   align-items: start;
 }
 
+.saved-crafts-content {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.saved-craft-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+.saved-craft-actions .link-btn,
+.saved-craft-item-actions .link-btn {
+  width: 100%;
+}
+
+.saved-craft-list {
+  display: grid;
+  gap: 0.55rem;
+  max-height: 520px;
+  overflow: auto;
+}
+
+.saved-craft-item {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  background: var(--bg-1);
+}
+
+.saved-craft-item.active {
+  background: var(--bg-2);
+}
+
+.saved-craft-meta {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.saved-craft-meta strong {
+  font-size: 0.9rem;
+}
+
+.saved-craft-meta span {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.saved-craft-item-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.4rem;
+}
+
+.hidden-input {
+  display: none;
+}
+
 .settings-card {
   border-radius: 0.8rem;
   padding: 0.8rem;
@@ -390,6 +503,33 @@ button:focus {
   font-size: 0.82rem;
 }
 
+.field-card {
+  display: grid;
+  gap: 0.35rem;
+  min-height: 100%;
+  color: var(--muted);
+  font-size: 0.79rem;
+  font-weight: 600;
+}
+
+.field-toggle-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.field-toggle-row .toggle-chip {
+  width: 100%;
+  height: 2.35rem;
+  border-radius: 0.55rem;
+}
+
+.field-card small {
+  color: rgba(184, 166, 154, 0.88);
+  font-size: 0.72rem;
+  font-weight: 500;
+}
+
 .settings-grid.compact {
   grid-template-columns: minmax(220px, 340px);
 }
@@ -416,6 +556,10 @@ button:focus {
   background: var(--bg-1);
   border-radius: 0.75rem;
   padding: 0.72rem;
+}
+
+.summary-card[title] {
+  cursor: help;
 }
 
 .summary-card h4 {
@@ -454,6 +598,11 @@ button:focus {
 .banner.error {
   border: none;
   background: rgba(212, 132, 114, 0.14);
+}
+
+.banner.info {
+  border: none;
+  background: rgba(201, 149, 114, 0.12);
 }
 
 .table-wrap {
@@ -549,6 +698,9 @@ td {
 }
 
 .row-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 2rem;
   height: 2rem;
   border-radius: 999px;
@@ -556,10 +708,15 @@ td {
   background: var(--panel-strong);
   color: var(--accent);
   cursor: pointer;
+  padding: 0;
+  line-height: 1;
 }
 
 .row-toggle span {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
 }
 
 .row-toggle.expanded span {
@@ -652,11 +809,38 @@ td {
   border-radius: 999px;
   font-size: 0.72rem;
   font-weight: 700;
+  line-height: 1;
+}
+
+.row-status-icon.ready,
+.row-status-icon.stale-warning,
+.row-status-icon.stale-critical {
+  font-size: 0;
+}
+
+.row-status-icon.ready::before,
+.row-status-icon.stale-warning::before,
+.row-status-icon.stale-critical::before {
+  content: '';
+  width: 0.44rem;
+  height: 0.44rem;
+  border-radius: 999px;
+  background: currentColor;
 }
 
 .row-status-icon.ready {
   background: rgba(111, 187, 115, 0.14);
   color: var(--success);
+}
+
+.row-status-icon.stale-warning {
+  background: rgba(208, 160, 102, 0.18);
+  color: var(--warning);
+}
+
+.row-status-icon.stale-critical {
+  background: rgba(212, 132, 114, 0.18);
+  color: var(--danger);
 }
 
 .row-status-icon.partial {
@@ -988,6 +1172,10 @@ td {
 }
 
 @media (max-width: 1260px) {
+  .top-control-grid {
+    grid-template-columns: 1fr;
+  }
+
   .picker-filters {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -1019,6 +1207,10 @@ td {
   .planner-panel-actions {
     flex-wrap: wrap;
   }
+
+  .saved-craft-list {
+    max-height: none;
+  }
 }
 
 @media (max-width: 900px) {
@@ -1035,7 +1227,9 @@ td {
   .picker-filters,
   .settings-grid,
   .global-bar-grid,
-  .transport-grid {
+  .transport-grid,
+  .saved-craft-actions,
+  .saved-craft-item-actions {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1087,6 +1281,8 @@ td {
   .daily-bonus-grid,
   .settings-grid.compact,
   .summary-cards,
+  .saved-craft-actions,
+  .saved-craft-item-actions,
   .detail-metrics,
   .per-craft-options {
     grid-template-columns: 1fr;

@@ -201,10 +201,37 @@ function getPricePoint(
   estimated: number | null
   sellOrder: number | null
   buyOrder: number | null
+  sellOrderUpdatedAt: string | null
+  buyOrderUpdatedAt: string | null
   avgSoldPerDay30d: number | null
   avgPrice30d: number | null
 } | null {
   return getCachedPricePoint(priceBook.values, settings.serverRegion, ESTIMATE_WINDOW, location, itemId)
+}
+
+function getTimestampAgeHours(timestamp: string | null): number | null {
+  if (!timestamp) {
+    return null
+  }
+
+  const parsed = Date.parse(timestamp)
+  if (Number.isNaN(parsed)) {
+    return null
+  }
+
+  return Math.max(0, (Date.now() - parsed) / (1000 * 60 * 60))
+}
+
+function resolveMaxPriceAgeHours(timestamps: Array<string | null>): number | null {
+  const ages = timestamps
+    .map((timestamp) => getTimestampAgeHours(timestamp))
+    .filter((age): age is number => age !== null)
+
+  if (ages.length === 0) {
+    return null
+  }
+
+  return Math.max(...ages)
 }
 
 function resolveEstimatedPrice(
@@ -252,6 +279,23 @@ function resolveOutputSaleUnitPrice(
   )
 }
 
+function resolveOutputSaleTimestamp(
+  priceBook: PriceBook,
+  settings: AppSettings,
+  location: string,
+  itemId: string,
+  preferBlackMarketOrder: boolean,
+): string | null {
+  const pricePoint = getPricePoint(priceBook, settings, location, itemId)
+  if (!pricePoint) {
+    return null
+  }
+
+  return preferBlackMarketOrder
+    ? pricePoint.buyOrderUpdatedAt ?? pricePoint.sellOrderUpdatedAt
+    : pricePoint.sellOrderUpdatedAt ?? pricePoint.buyOrderUpdatedAt
+}
+
 function resolveMaterialPurchaseUnitPrice(
   priceBook: PriceBook,
   settings: AppSettings,
@@ -275,6 +319,26 @@ function resolveMaterialPurchaseUnitPrice(
       const buyOrder = pricePoint?.buyOrder ?? null
       return buyOrder !== null ? buyOrder * (1 + listingTaxPct / 100) : null
     }
+    default:
+      return null
+  }
+}
+
+function resolveMaterialPurchaseTimestamp(
+  priceBook: PriceBook,
+  settings: AppSettings,
+  buyPriceType: BuyPriceType,
+  location: string,
+  itemId: string,
+): string | null {
+  const pricePoint = getPricePoint(priceBook, settings, location, itemId)
+
+  switch (buyPriceType) {
+    case 'INSTANT_BUY':
+      return pricePoint?.sellOrderUpdatedAt ?? null
+    case 'BUY_ORDER':
+      return pricePoint?.buyOrderUpdatedAt ?? null
+    case 'TRADE':
     default:
       return null
   }
@@ -348,6 +412,10 @@ function getJournalFameForPlan(baseItem: CraftItem, enchantment: EnchantmentLeve
     baseItem.journal.fameByEnchantment[0] ??
     0
   )
+}
+
+function getItemValueForPlan(baseItem: CraftItem, enchantment: EnchantmentLevel): number {
+  return baseItem.itemValueByEnchantment[enchantment] ?? baseItem.itemValueByEnchantment[0] ?? baseItem.itemValue ?? 0
 }
 
 function resolveCraftCityProfile(
@@ -448,8 +516,9 @@ export function collectRequiredPriceItemIds(params: {
   plans: SelectedCraftPlan[]
   itemsById: Map<string, CraftItem>
   knownMarketItemIds: Set<string>
+  includeJournals: boolean
 }): string[] {
-  const { plans, itemsById, knownMarketItemIds } = params
+  const { plans, itemsById, knownMarketItemIds, includeJournals } = params
   const requiredIds = new Set<string>()
 
   for (const plan of plans) {
@@ -464,7 +533,7 @@ export function collectRequiredPriceItemIds(params: {
       requiredIds.add(resolveResourceMarketItemId(resource.itemId, plan.enchantment, knownMarketItemIds))
     }
 
-    if (baseItem.journal) {
+    if (includeJournals && baseItem.journal) {
       requiredIds.add(baseItem.journal.emptyItemId)
       requiredIds.add(baseItem.journal.fullItemId)
     }
@@ -498,6 +567,7 @@ function calculateSinglePlan(params: {
   const sellCity = plan.sellCity
   const quantity = Math.max(1, plan.quantity)
   const returnRate = resolveReturnRate(baseItem.craftingCategory, craftCityProfile, settings)
+  const priceTimestamps: Array<string | null> = []
 
   const materialLines: MaterialCostLine[] = baseItem.recipe.map((resource) => {
     const marketItemId = resolveResourceMarketItemId(resource.itemId, plan.enchantment, knownMarketItemIds)
@@ -511,6 +581,9 @@ function calculateSinglePlan(params: {
       plan.buyPriceType,
       buyCity,
       marketItemId,
+    )
+    priceTimestamps.push(
+      resolveMaterialPurchaseTimestamp(priceBook, settings, plan.buyPriceType, buyCity, marketItemId),
     )
     const unitPrice = resolvedUnitPrice ?? 0
 
@@ -536,6 +609,9 @@ function calculateSinglePlan(params: {
     variant.marketItemId,
     sellCity === 'Black Market',
   )
+  priceTimestamps.push(
+    resolveOutputSaleTimestamp(priceBook, settings, sellCity, variant.marketItemId, sellCity === 'Black Market'),
+  )
   const avgSoldPerDay30d = resolveAverageSoldPerDay(priceBook, settings, sellCity, variant.marketItemId)
   const avgPrice30d = resolveAveragePrice30d(priceBook, settings, sellCity, variant.marketItemId)
   const craftCityPrice = resolveEstimatedPrice(priceBook, settings, craftCity, variant.marketItemId)
@@ -552,7 +628,7 @@ function calculateSinglePlan(params: {
   const materialBaseCost = sumNullable(
     materialLines.map((line) => (line.unitPrice ?? 0) * line.baseQuantity),
   )
-  const journalFamePerCraft = getJournalFameForPlan(baseItem, plan.enchantment)
+  const journalFamePerCraft = settings.includeJournals ? getJournalFameForPlan(baseItem, plan.enchantment) : 0
   const journalAmount =
     baseItem.journal && baseItem.journal.maxFame > 0 ? (journalFamePerCraft / baseItem.journal.maxFame) * quantity : 0
   const journalBuyCity = craftCity
@@ -567,10 +643,20 @@ function calculateSinglePlan(params: {
           baseItem.journal.emptyItemId,
         )
       : null
+  if (baseItem.journal && journalAmount > 0) {
+    priceTimestamps.push(
+      resolveMaterialPurchaseTimestamp(priceBook, settings, plan.buyPriceType, journalBuyCity, baseItem.journal.emptyItemId),
+    )
+  }
   const journalSellUnitPrice =
     baseItem.journal && journalAmount > 0
       ? resolveOutputSaleUnitPrice(priceBook, settings, journalSellCity, baseItem.journal.fullItemId, false)
       : null
+  if (baseItem.journal && journalAmount > 0) {
+    priceTimestamps.push(
+      resolveOutputSaleTimestamp(priceBook, settings, journalSellCity, baseItem.journal.fullItemId, false),
+    )
+  }
   const journalLine: JournalLine | null =
     baseItem.journal && journalAmount > 0
       ? {
@@ -593,18 +679,15 @@ function calculateSinglePlan(params: {
   const journalCost = journalLine?.buyTotalCost ?? 0
   const journalRevenue = journalLine?.sellTotalRevenue ?? 0
 
-  const estimatedMarketValue = craftCityPrice ?? sellPriceUnit
   const transportReferenceValue = craftCityPrice30d ?? sellCityPrice30d ?? 0
-  const itemValuePerCraft =
-    baseItem.itemValue > 0
-      ? baseItem.itemValue
-      : transportReferenceValue > 0
-        ? transportReferenceValue
-      : estimatedMarketValue !== null && estimatedMarketValue > 0
-        ? estimatedMarketValue
-        : null
+  const selectedItemValue = getItemValueForPlan(baseItem, plan.enchantment)
+  const itemValuePerCraft = selectedItemValue > 0 ? selectedItemValue : null
   const stationNutrition =
     itemValuePerCraft !== null ? itemValuePerCraft * TOTAL_NUTRITION_PER_ITEM_VALUE * quantity : null
+  const stationFee =
+    stationNutrition !== null
+      ? (stationNutrition * Math.max(0, settings.craftingStationFeePer100Nutrition)) / 100
+      : null
 
   const marketTaxPct = getMarketListingTaxPct(settings.hasPremium) + getMarketSalesTaxPct()
   const productRevenue = sellPriceUnit * quantity
@@ -620,7 +703,9 @@ function calculateSinglePlan(params: {
       : 0
 
   const totalCost =
-    materialEffectiveCost !== null && transportFee !== null ? materialEffectiveCost + journalCost + transportFee : null
+    materialEffectiveCost !== null && transportFee !== null && stationFee !== null
+      ? materialEffectiveCost + journalCost + stationFee + transportFee
+      : null
 
   const netProfit =
     revenue !== null && marketFee !== null && totalCost !== null ? revenue - marketFee - totalCost : null
@@ -637,8 +722,9 @@ function calculateSinglePlan(params: {
     materialLines,
     journalLine,
     missingPrices: deduplicate(missingPrices),
-    estimatedMarketValue,
+    estimatedMarketValue: craftCityPrice ?? sellPriceUnit,
     sellPriceUnit,
+    priceAgeHours: resolveMaxPriceAgeHours(priceTimestamps),
     avgSoldPerDay30d,
     avgPrice30d,
     materialBaseCost,
@@ -648,6 +734,7 @@ function calculateSinglePlan(params: {
     journalRevenue,
     itemValuePerCraft,
     stationNutrition,
+    stationFee,
     marketFee,
     transportFee,
     totalCost,
@@ -698,6 +785,7 @@ export function calculatePlannedCrafts(params: {
     readyCrafts: readyResults.length,
     totalCost: readyResults.reduce((sum, result) => sum + (result.totalCost ?? 0), 0),
     totalRevenue: readyResults.reduce((sum, result) => sum + (result.revenue ?? 0), 0),
+    totalStationFee: readyResults.reduce((sum, result) => sum + (result.stationFee ?? 0), 0),
     totalMarketFee: readyResults.reduce((sum, result) => sum + (result.marketFee ?? 0), 0),
     totalProfit: readyResults.reduce((sum, result) => sum + (result.netProfit ?? 0), 0),
     totalProfitPct: null as number | null,
